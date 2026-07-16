@@ -1,0 +1,1932 @@
+#!/usr/bin/env python3
+"""hyprmods — install/enable manager for your Hyprland projects.
+
+This is NOT a runtime mode switcher (Super+W still does that for winmode).
+Toggling a project here wires or unwires it from Hyprland:
+
+  ON  → binds, exec-once, sources, plugins active (installed)
+  OFF → hotkeys do nothing, no boot hooks, daemons stopped (practically uninstalled)
+
+Files:
+  ~/.config/hyprmods/enabled.json     which projects are installed
+  ~/.config/hypr/hyprmods.conf        generated snippet (sourced by hyprland)
+
+Usage:
+  hyprmods                 GTK manager
+  hyprmods list
+  hyprmods toggle winbar
+  hyprmods on|off <id>
+  hyprmods install <id>    clone from GitHub + run install.sh if missing
+  hyprmods install-all     install every project that is not on disk
+  hyprmods menu            rofi picker
+  hyprmods apply           rewrite conf + reload (no state change)
+  hyprmods migrate         strip legacy lines from hyprland.conf (once)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+HOME = Path.home()
+BIN = HOME / ".local" / "bin"
+LIB = HOME / ".local" / "lib"
+STATE_ROOT = HOME / ".local" / "state"
+CFG = HOME / ".config" / "hyprmods"
+ENABLED_FILE = CFG / "enabled.json"
+HYPR_DIR = HOME / ".config" / "hypr"
+HYPR_CONF = HYPR_DIR / "hyprland.conf"
+GENERATED = HYPR_DIR / "hyprmods.conf"
+MARKER_BEGIN = "# >>> hyprmods managed (do not edit) >>>"
+MARKER_END = "# <<< hyprmods managed <<<"
+SOURCE_LINE = "source = ~/.config/hypr/hyprmods.conf"
+THEME_CURRENT = HOME / ".config" / "themes" / ".current"
+# Clones for projects not already present elsewhere on the system
+SRC_ROOT = Path(
+    os.environ.get("HYPRMODS_SRC", HOME / ".local" / "src" / "hyprmods")
+)
+GITHUB_OWNER = os.environ.get("HYPRMODS_GITHUB_OWNER", "rippelz")
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def which(name: str) -> Optional[Path]:
+    p = shutil.which(name)
+    if p:
+        return Path(p)
+    cand = BIN / name
+    return cand if cand.is_file() and os.access(cand, os.X_OK) else None
+
+
+def run(
+    argv: list[str] | str,
+    *,
+    timeout: float = 90,
+    env: Optional[dict] = None,
+) -> tuple[int, str]:
+    if isinstance(argv, str):
+        argv = [argv]
+    e = {**os.environ, "PATH": f"{BIN}:{os.environ.get('PATH', '')}"}
+    if env:
+        e.update(env)
+    try:
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, env=e
+        )
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+        return r.returncode, out.strip()
+    except FileNotFoundError:
+        return 127, f"not found: {argv[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+
+
+def notify(title: str, body: str = "") -> None:
+    if which("notify-send"):
+        subprocess.Popen(
+            ["notify-send", "-a", "hyprmods", "-t", "2500", title, body],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def pgrep_x(name: str) -> bool:
+    return run(["pgrep", "-x", name])[0] == 0
+
+
+def pkill_x(name: str) -> None:
+    run(["pkill", "-x", name])
+    run(["pkill", "-9", "-x", name])
+
+
+def plugin_loaded(needle: str) -> bool:
+    code, out = run(["hyprctl", "plugin", "list"])
+    return code == 0 and needle.lower() in out.lower()
+
+
+def plugin_path(name: str) -> Optional[Path]:
+    for p in (LIB / f"{name}.so", LIB / f"lib{name}.so"):
+        if p.is_file():
+            return p
+    return None
+
+
+def plugin_load(name: str) -> None:
+    path = plugin_path(name)
+    if not path or plugin_loaded(name):
+        return
+    run(["hyprctl", "plugin", "load", str(path)])
+
+
+def plugin_unload(name: str) -> None:
+    path = plugin_path(name)
+    if not plugin_loaded(name):
+        return
+    if path:
+        code, _ = run(["hyprctl", "plugin", "unload", str(path)])
+        if code == 0:
+            return
+    run(["hyprctl", "plugin", "unload", name])
+
+
+def current_theme() -> str:
+    try:
+        return THEME_CURRENT.read_text(encoding="utf-8").strip() or "—"
+    except OSError:
+        return "—"
+
+
+def ensure_dirs() -> None:
+    CFG.mkdir(parents=True, exist_ok=True)
+    HYPR_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# enable state
+# ---------------------------------------------------------------------------
+
+def default_enabled() -> dict[str, bool]:
+    """First run: everything present on disk starts enabled."""
+    return {m.id: True for m in PROJECTS}
+
+
+def load_enabled() -> dict[str, bool]:
+    ensure_dirs()
+    base = default_enabled()
+    if not ENABLED_FILE.is_file():
+        save_enabled(base)
+        return dict(base)
+    try:
+        data = json.loads(ENABLED_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return base
+        # merge: known projects only; new projects default on
+        out = dict(base)
+        for k, v in data.items():
+            if k in out:
+                out[k] = bool(v)
+        return out
+    except (OSError, json.JSONDecodeError):
+        return base
+
+
+def save_enabled(state: dict[str, bool]) -> None:
+    ensure_dirs()
+    ENABLED_FILE.write_text(
+        json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def is_enabled(pid: str, state: Optional[dict[str, bool]] = None) -> bool:
+    st = state if state is not None else load_enabled()
+    return bool(st.get(pid, True))
+
+
+# ---------------------------------------------------------------------------
+# project registry — install units
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Keybind:
+    """A key (or input) this project claims, and when it is active."""
+
+    keys: str  # e.g. "Super+W"
+    action: str  # short what it does
+    when: str  # e.g. "always (while installed)", "winmode ON"
+
+
+def kb(keys: str, action: str, when: str) -> Keybind:
+    return Keybind(keys=keys, action=action, when=when)
+
+
+@dataclass
+class Project:
+    id: str
+    name: str
+    desc: str
+    category: str = "project"  # project | plugin | utility
+    source: str = ""
+    # GitHub repo for auto-install: "owner/name" or bare "name" (uses GITHUB_OWNER)
+    github: str = ""
+    # lines injected into hyprmods.conf when enabled (hyprland syntax)
+    conf_lines: list[str] = field(default_factory=list)
+    # keybinds this project eats (shown in UI/CLI)
+    binds: list[Keybind] = field(default_factory=list)
+    # optional: required binaries (any missing → show as not installed on disk)
+    requires: list[str] = field(default_factory=list)
+    # called when flipping OFF — stop daemons, clear mode, unload plugins
+    on_disable: Optional[Callable[[], None]] = None
+    # called when flipping ON — start boot helpers for this session
+    on_enable: Optional[Callable[[], None]] = None
+    # live activity (informational only — mode currently running)
+    activity: Optional[Callable[[], str]] = None
+
+    def on_disk(self) -> bool:
+        if not self.requires:
+            return True
+        return all(which(r) is not None or plugin_path(r) is not None for r in self.requires)
+
+    def repo_slug(self) -> str:
+        g = (self.github or "").strip()
+        if not g:
+            return ""
+        if "/" in g:
+            return g
+        return f"{GITHUB_OWNER}/{g}"
+
+    def binds_by_when(self) -> list[tuple[str, list[Keybind]]]:
+        """Group binds by circumstance, preserving first-seen order."""
+        order: list[str] = []
+        groups: dict[str, list[Keybind]] = {}
+        for b in self.binds:
+            if b.when not in groups:
+                order.append(b.when)
+                groups[b.when] = []
+            groups[b.when].append(b)
+        return [(w, groups[w]) for w in order]
+
+
+def _empty_mode_conf() -> None:
+    p = HYPR_DIR / "mode.conf"
+    p.write_text(
+        "# Managed by winmode — currently OFF (hyprmods disabled winbar).\n",
+        encoding="utf-8",
+    )
+
+
+def _empty_infini_conf() -> None:
+    p = HYPR_DIR / "infini.conf"
+    p.write_text(
+        "# Managed by infiniscroll — currently OFF (hyprmods disabled infiniscroll).\n",
+        encoding="utf-8",
+    )
+
+
+def _disable_winbar() -> None:
+    # Leave windows mode cleanly if active
+    if (STATE_ROOT / "winmode" / "on").exists() and which("winmode"):
+        run([str(which("winmode"))], timeout=30)
+    # Force chrome out of winmode bits
+    if which("winmode-chrome"):
+        run([str(which("winmode-chrome")), "leave"], timeout=20)
+    pkill_x("winbar-dock")
+    pkill_x("winbar-desk")
+    # Keep a normal waybar so the desktop isn't bar-less mid-session
+    if not pgrep_x("waybar"):
+        subprocess.Popen(
+            ["waybar"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    plugin_unload("hypr-minimize")
+    _empty_mode_conf()
+    # clear mode flag if leave didn't
+    try:
+        (STATE_ROOT / "winmode" / "on").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _enable_winbar() -> None:
+    if which("winmode-boot"):
+        subprocess.Popen(
+            [str(which("winmode-boot"))],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    elif which("winmode-chrome"):
+        run([str(which("winmode-chrome")), "boot"], timeout=20)
+
+
+def _winbar_activity() -> str:
+    if (STATE_ROOT / "winmode" / "on").exists():
+        return "mode ON"
+    if pgrep_x("waybar"):
+        return "bar up"
+    return ""
+
+
+def _disable_infiniscroll() -> None:
+    if (STATE_ROOT / "infiniscroll" / "on").exists() and which("infiniscroll"):
+        run([str(which("infiniscroll"))], timeout=45)
+    # belt-and-suspenders
+    for name in ("infiniscroll-zoomd", "infiniscroll-under", "infiniscroll-pan", "infiniscroll-rt"):
+        pkill_x(name)
+    # pid files
+    sd = STATE_ROOT / "infiniscroll"
+    for pidf in ("zoomd.pid", "under.pid"):
+        f = sd / pidf
+        if f.is_file():
+            try:
+                pid = int(f.read_text().strip())
+                os.kill(pid, 15)
+            except (OSError, ValueError):
+                pass
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+    _empty_infini_conf()
+    try:
+        (STATE_ROOT / "infiniscroll" / "on").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _enable_infiniscroll() -> None:
+    if which("infiniscroll-boot"):
+        subprocess.Popen(
+            [str(which("infiniscroll-boot"))],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def _infini_activity() -> str:
+    if (STATE_ROOT / "infiniscroll" / "on").exists():
+        return "mode ON"
+    return ""
+
+
+def _disable_theme() -> None:
+    # Keep applied colors/wallpaper — only unwire Super+T.
+    pass
+
+
+def _enable_theme() -> None:
+    pass
+
+
+def _pgrep_f(pattern: str) -> bool:
+    """True if a real process cmdline matches pattern (ignores pgrep/hyprmods noise)."""
+    code, out = run(["pgrep", "-af", pattern])
+    if code != 0 or not out:
+        return False
+    rx = re.compile(pattern)
+    for line in out.splitlines():
+        # "12345 /path/cmd args"
+        cmd = line.split(None, 1)[1] if " " in line else line
+        low = cmd.lower()
+        if "pgrep" in low or "pkill" in low or "hyprmods" in low:
+            continue
+        if "dump_bash_state" in cmd or "GROK_AGENT" in cmd:
+            continue
+        if rx.search(cmd):
+            return True
+    return False
+
+
+def _pkill_f(pattern: str) -> None:
+    # Resolve PIDs with the same filter so we don't kill tooling shells.
+    code, out = run(["pgrep", "-af", pattern])
+    if code != 0 or not out:
+        return
+    rx = re.compile(pattern)
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_s, cmd = parts[0], parts[1]
+        low = cmd.lower()
+        if "pgrep" in low or "pkill" in low or "hyprmods" in low:
+            continue
+        if "dump_bash_state" in cmd or "GROK_AGENT" in cmd:
+            continue
+        if not rx.search(cmd):
+            continue
+        try:
+            os.kill(int(pid_s), 15)
+        except (OSError, ValueError):
+            pass
+    time.sleep(0.1)
+    # force leftovers
+    code, out = run(["pgrep", "-af", pattern])
+    if code != 0 or not out:
+        return
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_s, cmd = parts[0], parts[1]
+        if "pgrep" in cmd.lower() or "hyprmods" in cmd.lower() or "dump_bash_state" in cmd:
+            continue
+        if not rx.search(cmd):
+            continue
+        try:
+            os.kill(int(pid_s), 9)
+        except (OSError, ValueError):
+            pass
+
+
+def _disable_wallpaper_boot() -> None:
+    # Stop whatever wallpaper-boot would own this session.
+    # (hyprmotion is third-party; wallpaper-boot may start it for video themes)
+    if which("hyprmotion"):
+        run([str(which("hyprmotion")), "stop"], timeout=15)
+    pkill_x("mpvpaper")
+    pkill_x("hyprmotion")
+    pkill_x("hyprpaper")
+
+
+def _enable_wallpaper_boot() -> None:
+    if which("wallpaper-boot"):
+        subprocess.Popen(
+            [str(which("wallpaper-boot"))],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def _wallpaper_boot_activity() -> str:
+    if pgrep_x("hyprmotion") or pgrep_x("mpvpaper"):
+        return "video engine"
+    if pgrep_x("hyprpaper"):
+        return "static (hyprpaper)"
+    return ""
+
+
+def _disable_obs() -> None:
+    # Stop replay buffer if OBS is up; leave the OBS window alone
+    # (user may be mid-stream). Next login won't autostart.
+    if which("obs-replay") and _pgrep_f(r"\bobs(\s|--)"):
+        run([str(which("obs-replay")), "stop"], timeout=8)
+
+
+def _enable_obs() -> None:
+    if not which("obs-boot"):
+        return
+    if _pgrep_f(r"(^|/)obs(\s|$)|obs-studio"):
+        return
+    subprocess.Popen(
+        [str(which("obs-boot"))],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _obs_activity() -> str:
+    if _pgrep_f(r"(^|/)obs(\s|$)|obs-studio|--startreplaybuffer"):
+        return "OBS up"
+    return ""
+
+
+def _disable_autoclicker() -> None:
+    _pkill_f(r"autoclicker(\.py)?")
+
+
+def _enable_autoclicker() -> None:
+    # Interactive TUI — user launches with `autoclicker`. Nothing to boot.
+    pass
+
+
+def _autoclicker_activity() -> str:
+    if _pgrep_f(r"autoclicker(\.py)?"):
+        return "running"
+    return ""
+
+
+def _disable_app_recency() -> None:
+    _pkill_f(r"app-recency")
+
+
+def _enable_app_recency() -> None:
+    if not which("app-recency"):
+        return
+    if _pgrep_f(r"app-recency"):
+        return
+    subprocess.Popen(
+        [str(which("app-recency")), "daemon"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _app_recency_activity() -> str:
+    if _pgrep_f(r"app-recency"):
+        return "daemon"
+    return ""
+
+
+def _disable_nominsize() -> None:
+    plugin_unload("hypr-nominsize")
+
+
+def _enable_nominsize() -> None:
+    plugin_load("hypr-nominsize")
+
+
+def _disable_minimize() -> None:
+    plugin_unload("hypr-minimize")
+
+
+def _enable_minimize() -> None:
+    plugin_load("hypr-minimize")
+
+
+def _disable_rgb() -> None:
+    if which("rgb"):
+        run([str(which("rgb")), "off"], timeout=15)
+
+
+def _enable_rgb() -> None:
+    if which("rgb"):
+        run([str(which("rgb")), "on"], timeout=15)
+
+
+def _rgb_activity() -> str:
+    f = HOME / ".cache" / "rgb_lights.state"
+    try:
+        if f.read_text().strip().lower() in ("on", "1", "true"):
+            return "on"
+    except OSError:
+        pass
+    return ""
+
+
+def build_projects() -> list[Project]:
+    return [
+        Project(
+            id="winbar",
+            name="Winbar",
+            desc="Windows desktop mode — taskbar, start menu, desktop icons",
+            category="project",
+            source=str(HOME / "code" / "winbar"),
+            github="winbar",
+            requires=["winmode", "winmode-boot", "toggle-waybar"],
+            conf_lines=[
+                "# winbar",
+                "exec-once = ~/.local/bin/winmode-boot",
+                "bind = $mainMod, W, exec, ~/.local/bin/winmode",
+                "bind = $mainMod, B, exec, ~/.local/bin/toggle-waybar",
+                "source = ~/.config/hypr/mode.conf",
+            ],
+            binds=[
+                kb("Super+W", "toggle windows mode on/off", "always (while installed)"),
+                kb("Super+B", "hide/show taskbar (+ dock icons in winmode)", "always (while installed)"),
+                kb("Alt+Tab", "cycle window previews (hold Tab)", "only while winmode ON"),
+                kb("Alt+Shift+Tab", "cycle previews backward", "only while winmode ON"),
+                kb("Alt release", "commit alt-tab selection", "only while winmode ON"),
+                kb("Alt+Esc", "cancel alt-tab", "only while winmode ON"),
+                kb("Super+Tab", "task view (all workspaces)", "only while winmode ON"),
+                kb("Super+.", "emoji picker", "only while winmode ON"),
+                kb("Super+R", "start menu (replaces default rofi bind)", "only while winmode ON"),
+                kb("Super+M", "minimize / restore active window", "only while winmode ON"),
+            ],
+            on_disable=_disable_winbar,
+            on_enable=_enable_winbar,
+            activity=_winbar_activity,
+        ),
+        Project(
+            id="infiniscroll",
+            name="Infiniscroll",
+            desc="Infinite-canvas desktops — pan, zoom, cluster",
+            category="project",
+            source=str(HOME / "code" / "infiniscroll"),
+            github="infiniscroll",
+            requires=["infiniscroll", "infiniscroll-boot"],
+            conf_lines=[
+                "# infiniscroll",
+                "exec-once = ~/.local/bin/infiniscroll-boot",
+                "bind = $mainMod, I, exec, ~/.local/bin/infiniscroll",
+                "source = ~/.config/hypr/infini.conf",
+            ],
+            binds=[
+                kb("Super+I", "toggle infinite-canvas mode on/off", "always (while installed)"),
+                kb("Super+Space (hold)", "grab-pan canvas", "only while infiniscroll ON"),
+                kb("Super+Shift+Space", "auto-sort floats around center", "only while infiniscroll ON"),
+                kb("Super+←↑↓→", "focus neighbor + pan to center (replaces movefocus)", "only while infiniscroll ON"),
+                kb("Super+scroll", "zoom canvas (evdev zoomd, not hypr bind)", "only while infiniscroll ON"),
+                kb("Super+Shift+scroll", "reset zoom to 100%", "only while infiniscroll ON"),
+                kb("Super+V", "cluster layout (replaces togglefloating)", "only while infiniscroll ON"),
+                kb("Super+F", "true fullscreen float (replaces fullscreen)", "only while infiniscroll ON"),
+                kb("Super+H", "recenter canvas origin", "only while infiniscroll ON"),
+                kb("Super+Shift+H", "gather stray windows", "only while infiniscroll ON"),
+            ],
+            on_disable=_disable_infiniscroll,
+            on_enable=_enable_infiniscroll,
+            activity=_infini_activity,
+        ),
+        Project(
+            id="theme",
+            name="Theme switcher",
+            desc="theme + theme-ui gallery (applied look stays in theme.conf)",
+            category="project",
+            source=str(HOME / ".config" / "themes"),
+            github="",  # personal theme store — not published
+            requires=["theme-ui"],
+            conf_lines=[
+                "# theme switcher",
+                "bind = $mainMod, T, exec, ~/.local/bin/theme-ui",
+            ],
+            binds=[
+                kb("Super+T", "open theme gallery / creator", "always (while installed)"),
+            ],
+            on_disable=_disable_theme,
+            on_enable=_enable_theme,
+            activity=lambda: f"now · {current_theme()}" if current_theme() != "—" else "",
+        ),
+        Project(
+            id="wallpaper-boot",
+            name="Wallpaper boot",
+            desc="Login wallpaper picker: video engine or hyprpaper per theme config",
+            category="project",
+            source=str(BIN / "wallpaper-boot"),
+            github="hypr-bits",
+            requires=["wallpaper-boot"],
+            conf_lines=[
+                "# wallpaper-boot",
+                "exec-once = ~/.local/bin/wallpaper-boot",
+            ],
+            binds=[],
+            on_disable=_disable_wallpaper_boot,
+            on_enable=_enable_wallpaper_boot,
+            activity=_wallpaper_boot_activity,
+        ),
+        Project(
+            id="obs-replay",
+            name="OBS replay",
+            desc="Autostart OBS with replay buffer + clip hotkeys",
+            category="project",
+            source=str(BIN / "obs-replay"),
+            github="hypr-bits",
+            requires=["obs-boot", "obs-replay"],
+            conf_lines=[
+                "# obs replay",
+                "exec-once = ~/.local/bin/obs-boot",
+                "bind = SUPER, F8, exec, ~/.local/bin/obs-replay save",
+                "bind = SUPER, F9, exec, ~/.local/bin/obs-replay start",
+                "bind = SUPER SHIFT, F9, exec, ~/.local/bin/obs-replay stop",
+            ],
+            binds=[
+                kb("Super+F8", "save replay clip", "always (while installed)"),
+                kb("Super+F9", "start replay buffer", "always (while installed)"),
+                kb("Super+Shift+F9", "stop replay buffer", "always (while installed)"),
+            ],
+            on_disable=_disable_obs,
+            on_enable=_enable_obs,
+            activity=_obs_activity,
+        ),
+        Project(
+            id="autoclicker",
+            name="Autoclicker",
+            desc="Window-targeted autoclicker. Launch: autoclicker",
+            category="utility",
+            source=str(HOME / "code" / "autoclicker"),
+            github="autoclicker",
+            requires=["autoclicker"],
+            conf_lines=[
+                "# autoclicker — no Hyprland binds (hotkey via evdev while process runs)",
+            ],
+            binds=[
+                kb(
+                    "F7 (default)",
+                    "toggle clicking (configurable in app)",
+                    "only while autoclicker process is running (evdev, not Hypr)",
+                ),
+            ],
+            on_disable=_disable_autoclicker,
+            on_enable=_enable_autoclicker,
+            activity=_autoclicker_activity,
+        ),
+        Project(
+            id="app-recency",
+            name="App recency",
+            desc="Rofi drun sorted by last-used (Hyprland focus daemon)",
+            category="utility",
+            source=str(BIN / "app-recency"),
+            github="hypr-bits",
+            requires=["app-recency"],
+            conf_lines=[
+                "# app-recency",
+                "exec-once = ~/.local/bin/app-recency daemon",
+            ],
+            binds=[],
+            on_disable=_disable_app_recency,
+            on_enable=_enable_app_recency,
+            activity=_app_recency_activity,
+        ),
+        Project(
+            id="opaque",
+            name="Solid window",
+            desc="Glass ↔ solid for the focused window",
+            category="utility",
+            github="hypr-bits",
+            requires=["toggle-opaque"],
+            conf_lines=[
+                "# solid window",
+                "bind = $mainMod, O, exec, ~/.local/bin/toggle-opaque",
+            ],
+            binds=[
+                kb("Super+O", "toggle solid / glass on focused window", "always (while installed)"),
+            ],
+        ),
+        Project(
+            id="hypr-nominsize",
+            name="hypr-nominsize",
+            desc="Plugin: ignore client min-size (Spotify etc.)",
+            category="plugin",
+            source=str(HOME / "code" / "hypr-nominsize"),
+            github="hypr-nominsize",
+            requires=["hypr-nominsize"],
+            conf_lines=[
+                "# hypr-nominsize",
+                "exec-once = hyprctl plugin load $HOME/.local/lib/hypr-nominsize.so",
+            ],
+            binds=[],
+            on_disable=_disable_nominsize,
+            on_enable=_enable_nominsize,
+            activity=lambda: "loaded" if plugin_loaded("hypr-nominsize") else "",
+        ),
+        Project(
+            id="hypr-minimize",
+            name="hypr-minimize",
+            desc="Plugin: titlebar minimize → dock (used by winbar)",
+            category="plugin",
+            source=str(HOME / "code" / "winbar" / "plugin"),
+            github="winbar",  # built by winbar install.sh
+            requires=["hypr-minimize"],
+            conf_lines=[
+                "# hypr-minimize — winmode-boot also loads this when winbar is on",
+            ],
+            binds=[],
+            on_disable=_disable_minimize,
+            on_enable=_enable_minimize,
+            activity=lambda: "loaded" if plugin_loaded("hypr-minimize") else "",
+        ),
+        Project(
+            id="rgb",
+            name="RGB lights",
+            desc="OpenRGB motherboard / keyboard / mouse",
+            category="utility",
+            github="hypr-bits",
+            requires=["rgb"],
+            conf_lines=[],
+            binds=[],
+            on_disable=_disable_rgb,
+            on_enable=_enable_rgb,
+            activity=_rgb_activity,
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# GitHub install
+# ---------------------------------------------------------------------------
+
+def clone_or_update(slug: str) -> tuple[bool, Path, str]:
+    """Clone github.com/slug into SRC_ROOT/<name>. Prefer `gh` for private repos."""
+    name = slug.split("/")[-1]
+    dest = SRC_ROOT / name
+    SRC_ROOT.mkdir(parents=True, exist_ok=True)
+
+    if (dest / ".git").is_dir():
+        code, out = run(["git", "-C", str(dest), "pull", "--ff-only"], timeout=120)
+        if code != 0:
+            # still usable if pull fails (offline etc.)
+            return True, dest, f"pull warn: {out or 'failed'} (using existing clone)"
+        return True, dest, f"updated {dest}"
+
+    if dest.exists():
+        shutil.rmtree(dest)
+
+    # gh handles auth for private repos
+    if which("gh"):
+        code, out = run(
+            ["gh", "repo", "clone", slug, str(dest)],
+            timeout=300,
+        )
+        if code == 0 and (dest / ".git").is_dir():
+            return True, dest, f"cloned {slug} → {dest}"
+
+    url = f"https://github.com/{slug}.git"
+    code, out = run(["git", "clone", url, str(dest)], timeout=300)
+    if code != 0 or not (dest / ".git").is_dir():
+        return False, dest, out or f"clone failed: {slug}"
+    return True, dest, f"cloned {slug} → {dest}"
+
+
+def run_install_script(repo_dir: Path) -> tuple[bool, str]:
+    script = repo_dir / "install.sh"
+    if not script.is_file():
+        return False, f"no install.sh in {repo_dir}"
+    code, out = run(["bash", str(script)], timeout=900)
+    if code != 0:
+        return False, out or f"install.sh exit {code}"
+    return True, out or "install.sh ok"
+
+
+def install_from_github(pid: str) -> tuple[bool, str]:
+    """If binaries are missing, clone from GitHub and run install.sh."""
+    p = get_project(pid)
+    if not p:
+        return False, f"unknown project: {pid}"
+    if p.on_disk():
+        return True, f"{p.name} already on disk"
+    slug = p.repo_slug()
+    if not slug:
+        return False, (
+            f"{p.name}: not on disk and no GitHub repo configured "
+            f"(local-only project)"
+        )
+
+    ok, dest, msg = clone_or_update(slug)
+    if not ok:
+        return False, f"{p.name}: {msg}"
+
+    ok2, msg2 = run_install_script(dest)
+    if not ok2:
+        return False, f"{p.name}: clone ok ({msg}); install failed: {msg2}"
+
+    if not p.on_disk():
+        return False, (
+            f"{p.name}: install finished but still not detected "
+            f"(expected: {', '.join(p.requires) or '—'}). {msg2}"
+        )
+    return True, f"{p.name} installed from github.com/{slug}\n{msg}\n{msg2}"
+
+
+def install_all_missing() -> tuple[bool, str]:
+    lines: list[str] = []
+    # de-dupe by github repo so hypr-bits only clones once
+    seen_slugs: set[str] = set()
+    any_fail = False
+    for p in PROJECTS:
+        if p.on_disk():
+            lines.append(f"· {p.id}: already on disk")
+            continue
+        slug = p.repo_slug()
+        if not slug:
+            lines.append(f"· {p.id}: skip (no github / local-only)")
+            continue
+        if slug in seen_slugs:
+            # same monorepo — re-run install only if still missing
+            if not p.on_disk():
+                dest = SRC_ROOT / slug.split("/")[-1]
+                if dest.is_dir():
+                    ok, msg = run_install_script(dest)
+                    lines.append(f"· {p.id}: re-install {msg}")
+                    if not ok:
+                        any_fail = True
+            else:
+                lines.append(f"· {p.id}: covered by {slug}")
+            continue
+        seen_slugs.add(slug)
+        ok, msg = install_from_github(p.id)
+        lines.append(f"· {p.id}: {msg}")
+        if not ok:
+            any_fail = True
+    return (not any_fail), "\n".join(lines)
+
+
+PROJECTS: list[Project] = build_projects()
+PROJECT_BY_ID = {p.id: p for p in PROJECTS}
+
+
+def get_project(key: str) -> Optional[Project]:
+    k = key.strip().lower()
+    if k in PROJECT_BY_ID:
+        return PROJECT_BY_ID[k]
+    # aliases
+    aliases = {
+        "winmode": "winbar",
+        "win": "winbar",
+        "infini": "infiniscroll",
+        "canvas": "infiniscroll",
+        "themes": "theme",
+        "theme-ui": "theme",
+        "wallpaper": "wallpaper-boot",
+        "wallpapers": "wallpaper-boot",
+        "wp": "wallpaper-boot",
+        "obs": "obs-replay",
+        "replay": "obs-replay",
+        "clicker": "autoclicker",
+        "click": "autoclicker",
+        "recency": "app-recency",
+        "rofi-recency": "app-recency",
+        "nominsize": "hypr-nominsize",
+        "minimize": "hypr-minimize",
+    }
+    if k in aliases:
+        return PROJECT_BY_ID[aliases[k]]
+    hits = [p for p in PROJECTS if p.id.startswith(k) or p.name.lower().startswith(k)]
+    return hits[0] if len(hits) == 1 else None
+
+
+# ---------------------------------------------------------------------------
+# generate hypr conf
+# ---------------------------------------------------------------------------
+
+def render_generated(state: dict[str, bool]) -> str:
+    lines = [
+        MARKER_BEGIN,
+        "# Auto-generated by hyprmods. Edit via: hyprmods toggle <id>",
+        f"# State: {ENABLED_FILE}",
+        "",
+    ]
+    enabled = [p for p in PROJECTS if state.get(p.id, True) and p.on_disk()]
+    if not enabled:
+        lines.append("# (no projects enabled)")
+    for p in enabled:
+        if not p.conf_lines:
+            continue
+        lines.extend(p.conf_lines)
+        lines.append("")
+    # always keep manager accessible
+    lines.extend(
+        [
+            "# hyprmods manager (always on)",
+            "bind = $mainMod, Y, exec, ~/.local/bin/hyprmods",
+            "bind = $mainMod SHIFT, Y, exec, ~/.local/bin/hyprmods menu",
+            MARKER_END,
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_generated(state: dict[str, bool]) -> None:
+    ensure_dirs()
+    GENERATED.write_text(render_generated(state), encoding="utf-8")
+
+
+def hypr_reload() -> None:
+    run(["hyprctl", "reload"], timeout=15)
+
+
+def ensure_hyprland_sources() -> tuple[bool, str]:
+    """Ensure hyprland.conf sources hyprmods.conf; strip legacy project lines.
+
+    Returns (changed, message).
+    """
+    if not HYPR_CONF.is_file():
+        return False, "hyprland.conf missing"
+
+    text = HYPR_CONF.read_text(encoding="utf-8")
+    original = text
+
+    # Patterns that used to live in the base conf — now owned by hyprmods.
+    # Match full lines (optional whitespace).
+    legacy = [
+        r"^\s*exec-once\s*=\s*~/.local/bin/wallpaper-boot\b.*$",
+        r"^\s*exec-once\s*=\s*~/.local/bin/winmode-boot\b.*$",
+        r"^\s*exec-once\s*=\s*~/.local/bin/infiniscroll-boot\b.*$",
+        r"^\s*exec-once\s*=\s*~/.local/bin/obs-boot\b.*$",
+        r"^\s*exec-once\s*=\s*~/.local/bin/app-recency\b.*$",
+        r"^\s*exec-once\s*=\s*hyprctl plugin load \$HOME/.local/lib/hypr-nominsize\.so\s*.*$",
+        r"^\s*exec-once\s*=\s*hyprctl plugin load .*hypr-nominsize\.so\s*.*$",
+        r"^\s*bind\s*=\s*\$mainMod,\s*W,\s*exec,\s*~/.local/bin/winmode\b.*$",
+        r"^\s*bind\s*=\s*\$mainMod,\s*I,\s*exec,\s*~/.local/bin/infiniscroll\b.*$",
+        r"^\s*bind\s*=\s*\$mainMod,\s*O,\s*exec,\s*~/.local/bin/toggle-opaque\b.*$",
+        r"^\s*bind\s*=\s*\$mainMod,\s*B,\s*exec,\s*~/.local/bin/toggle-waybar\b.*$",
+        r"^\s*bind\s*=\s*\$mainMod,\s*T,\s*exec,\s*~/.local/bin/theme-ui\b.*$",
+        r"^\s*bind\s*=\s*\$mainMod,\s*Y,\s*exec,\s*~/.local/bin/hyprmods\b.*$",
+        r"^\s*bind\s*=\s*\$mainMod\s*SHIFT,\s*Y,\s*exec,\s*~/.local/bin/hyprmods\b.*$",
+        r"^\s*bind\s*=\s*SUPER,\s*F8,\s*exec,\s*~/.local/bin/obs-replay\b.*$",
+        r"^\s*bind\s*=\s*SUPER,\s*F9,\s*exec,\s*~/.local/bin/obs-replay\b.*$",
+        r"^\s*bind\s*=\s*SUPER\s*SHIFT,\s*F9,\s*exec,\s*~/.local/bin/obs-replay\b.*$",
+        r"^\s*source\s*=\s*~/.config/hypr/mode\.conf\s*.*$",
+        r"^\s*source\s*=\s*~/.config/hypr/infini\.conf\s*.*$",
+    ]
+
+    for pat in legacy:
+        text = re.sub(pat, "", text, flags=re.MULTILINE)
+
+    # Drop leftover section chrome after line removal
+    text = re.sub(
+        r"\n#{3,}\n### WINDOWS MODE\s*###\n#{3,}\n+(?:#.*\n)*",
+        "\n",
+        text,
+    )
+    text = re.sub(
+        r"\n#{3,}\n### INFINITE SCROLL ###\n#{3,}\n+(?:#.*\n)*",
+        "\n",
+        text,
+    )
+    text = re.sub(
+        r"\n### INFINITE SCROLL ###\n#{3,}\n+(?:#.*\n)*",
+        "\n",
+        text,
+    )
+    text = re.sub(
+        r"\n# Overrides written/emptied by ~/.local/bin/(?:winmode|infiniscroll).*\n",
+        "\n",
+        text,
+    )
+    # collapse 3+ blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    if SOURCE_LINE not in text and "hyprmods.conf" not in text:
+        # append source at end so mode/infini overrides still win
+        if not text.endswith("\n"):
+            text += "\n"
+        text += (
+            "\n#################\n"
+            "### HYPRMODS  ###\n"
+            "#################\n"
+            "# Project installs managed by ~/.local/bin/hyprmods\n"
+            f"{SOURCE_LINE}\n"
+        )
+    elif SOURCE_LINE not in text:
+        # weird partial — force correct line at end
+        if not text.endswith("\n"):
+            text += "\n"
+        text += f"\n{SOURCE_LINE}\n"
+
+    if text != original:
+        # backup once
+        bak = HYPR_CONF.with_suffix(".conf.pre-hyprmods")
+        if not bak.exists():
+            bak.write_text(original, encoding="utf-8")
+        HYPR_CONF.write_text(text, encoding="utf-8")
+        return True, f"migrated hyprland.conf (backup: {bak.name})"
+    return False, "hyprland.conf already migrated"
+
+
+# ---------------------------------------------------------------------------
+# core enable/disable
+# ---------------------------------------------------------------------------
+
+def set_enabled(pid: str, want: bool, *, reload: bool = True) -> tuple[bool, str]:
+    p = get_project(pid)
+    if not p:
+        return False, f"unknown project: {pid}"
+    install_note = ""
+    if want and not p.on_disk():
+        if p.repo_slug():
+            ok_i, msg_i = install_from_github(p.id)
+            if not ok_i:
+                return False, msg_i
+            install_note = msg_i + "\n"
+        else:
+            return False, (
+                f"{p.name}: not on disk and cannot auto-install "
+                f"(need: {', '.join(p.requires) or '—'})"
+            )
+
+    state = load_enabled()
+    was = bool(state.get(p.id, True))
+    if was == want:
+        # still re-apply conf so disk matches
+        write_generated(state)
+        ensure_hyprland_sources()
+        if reload:
+            hypr_reload()
+        return True, install_note + f"{p.name} already {'enabled' if want else 'disabled'}"
+
+    if want:
+        state[p.id] = True
+        save_enabled(state)
+        write_generated(state)
+        ensure_hyprland_sources()
+        if reload:
+            hypr_reload()
+        if p.on_enable:
+            try:
+                p.on_enable()
+            except Exception as e:
+                return True, install_note + f"{p.name} enabled (activate warn: {e})"
+        notify("hyprmods", f"{p.name} wired (enabled)")
+        return True, install_note + f"{p.name} enabled — binds/boot active"
+    else:
+        # teardown first while hooks still exist
+        if p.on_disable:
+            try:
+                p.on_disable()
+            except Exception as e:
+                notify("hyprmods", f"{p.name} disable warn: {e}")
+        state[p.id] = False
+        save_enabled(state)
+        write_generated(state)
+        ensure_hyprland_sources()
+        if reload:
+            hypr_reload()
+        notify("hyprmods", f"{p.name} uninstalled (disabled)")
+        return True, f"{p.name} disabled — hotkeys inert, boot removed"
+
+
+def toggle_enabled(pid: str) -> tuple[bool, str]:
+    p = get_project(pid)
+    if not p:
+        return False, f"unknown project: {pid}"
+    return set_enabled(p.id, not is_enabled(p.id))
+
+
+def apply_all() -> tuple[bool, str]:
+    state = load_enabled()
+    write_generated(state)
+    changed, msg = ensure_hyprland_sources()
+    hypr_reload()
+    return True, f"applied · {msg}" if changed else "applied · conf rewritten + reload"
+
+
+# ---------------------------------------------------------------------------
+# CLI views
+# ---------------------------------------------------------------------------
+
+def format_binds_block(p: Project, *, indent: str = "         ") -> list[str]:
+    """Pretty multi-line bind list for terminal."""
+    if not p.binds:
+        return [f"{indent}keys   (none — no keyboard binds)"]
+    lines: list[str] = []
+    # column widths within this project
+    w_when = max(len(b.when) for b in p.binds)
+    w_keys = max(len(b.keys) for b in p.binds)
+    w_when = min(max(w_when, 8), 42)
+    w_keys = min(max(w_keys, 8), 28)
+    first = True
+    for when, group in p.binds_by_when():
+        for b in group:
+            label = "keys  " if first else "      "
+            first = False
+            lines.append(
+                f"{indent}{label}{b.when:<{w_when}}  {b.keys:<{w_keys}}  {b.action}"
+            )
+    return lines
+
+
+def cmd_list(plain: bool = False) -> int:
+    state = load_enabled()
+    if plain:
+        for p in PROJECTS:
+            en = "on" if state.get(p.id, True) and p.on_disk() else "off"
+            if not p.on_disk():
+                en = "missing"
+            print(f"{p.id}\t{en}\t{p.name}")
+        return 0
+
+    print(f"hyprmods · install manager · theme {current_theme()}")
+    print(f"state  {ENABLED_FILE}")
+    print(f"conf   {GENERATED}")
+    print()
+    for p in PROJECTS:
+        if not p.on_disk():
+            mark = "✗ miss"
+            gh = p.repo_slug()
+            tag = f"not on disk · install: github.com/{gh}" if gh else "not on disk (local-only)"
+        elif state.get(p.id, True):
+            mark = "● ON "
+            act = p.activity() if p.activity else ""
+            tag = act or "wired"
+        else:
+            mark = "○ off"
+            tag = "unwired"
+        print(f"  {mark}  {p.id:<16}  {p.name:<18}  {tag}")
+        print(f"         {p.desc}")
+        for line in format_binds_block(p):
+            print(line)
+        print()
+    print("  toggle = wire/unwire Hyprland  ·  install = clone from GitHub if missing")
+    print("  hyprmods install winbar · hyprmods install-all · hyprmods")
+    return 0
+
+
+def cmd_toggle(target: str, force: Optional[bool] = None) -> int:
+    p = get_project(target)
+    if not p:
+        print(f"unknown: {target}", file=sys.stderr)
+        print("ids:", ", ".join(x.id for x in PROJECTS), file=sys.stderr)
+        return 1
+    if force is None:
+        ok, msg = toggle_enabled(p.id)
+    else:
+        ok, msg = set_enabled(p.id, force)
+    print(msg)
+    return 0 if ok else 1
+
+
+def cmd_menu() -> int:
+    state = load_enabled()
+    lines = []
+    for p in PROJECTS:
+        if not p.on_disk():
+            tag = "[miss]"
+        elif state.get(p.id, True):
+            tag = "[ON] "
+        else:
+            tag = "[off]"
+        lines.append(f"{tag}  {p.name}\t{p.id}")
+    payload = "\n".join(lines)
+
+    choice = ""
+    if which("rofi"):
+        r = subprocess.run(
+            [
+                "rofi",
+                "-dmenu",
+                "-i",
+                "-p",
+                "hyprmods install",
+                "-format",
+                "s",
+                "-theme-str",
+                "window { width: 34em; } listview { lines: 12; }",
+            ],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if r.returncode != 0:
+            return 0
+        choice = (r.stdout or "").strip()
+    elif which("wofi"):
+        r = subprocess.run(
+            ["wofi", "--dmenu", "-p", "hyprmods"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if r.returncode != 0:
+            return 0
+        choice = (r.stdout or "").strip()
+    elif which("fzf"):
+        r = subprocess.run(
+            ["fzf", "--prompt=hyprmods> "],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if r.returncode != 0:
+            return 0
+        choice = (r.stdout or "").strip()
+    else:
+        print("need rofi, wofi, or fzf", file=sys.stderr)
+        return 1
+
+    mid = choice.split("\t")[-1].strip() if "\t" in choice else ""
+    if not mid:
+        for p in PROJECTS:
+            if p.name in choice:
+                mid = p.id
+                break
+    if not mid:
+        return 1
+    return cmd_toggle(mid)
+
+
+# ---------------------------------------------------------------------------
+# GTK UI
+# ---------------------------------------------------------------------------
+
+APP_CSS = """
+window { background-color: #0c0a12; }
+.header-bar { background-color: alpha(#120f1a, 0.94); }
+.title-main { font-size: 1.35em; font-weight: 750; letter-spacing: -0.02em; }
+.title-sub { opacity: 0.55; font-size: 0.88em; }
+.chip {
+  background-color: alpha(#b794f6, 0.16);
+  color: #d4b8ff;
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 0.78em;
+  font-weight: 600;
+}
+.section-label {
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  opacity: 0.5;
+  margin-top: 8px;
+  margin-bottom: 2px;
+}
+.mod-row {
+  background-color: #16131f;
+  border-radius: 14px;
+  border: 1px solid alpha(#fff, 0.06);
+  padding: 12px 14px;
+  margin: 3px 0;
+}
+.mod-row:hover {
+  border-color: alpha(#b794f6, 0.35);
+  background-color: #1c1828;
+}
+.mod-row.on { border-color: alpha(#7ec8e3, 0.45); }
+.mod-row.missing { opacity: 0.42; }
+.mod-name { font-weight: 650; font-size: 1.05em; }
+.mod-desc { opacity: 0.6; font-size: 0.86em; }
+.mod-meta {
+  font-family: monospace;
+  font-size: 0.75em;
+  opacity: 0.5;
+  margin-top: 2px;
+}
+.bind-block {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background-color: alpha(#0a0810, 0.65);
+  border: 1px solid alpha(#fff, 0.04);
+}
+.bind-head {
+  font-size: 0.68em;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  opacity: 0.45;
+  margin-bottom: 4px;
+}
+.bind-when {
+  font-size: 0.72em;
+  font-weight: 650;
+  color: #d4b8ff;
+  opacity: 0.9;
+  margin-top: 6px;
+  margin-bottom: 2px;
+}
+.bind-row {
+  font-family: monospace;
+  font-size: 0.78em;
+  opacity: 0.78;
+}
+.bind-keys {
+  font-weight: 650;
+  color: #c8ebf5;
+}
+.bind-action {
+  opacity: 0.75;
+}
+.bind-none {
+  font-size: 0.78em;
+  opacity: 0.4;
+  font-style: italic;
+}
+.status-dot {
+  font-weight: 700;
+  font-size: 0.75em;
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+.status-on { background-color: alpha(#7ec8e3, 0.22); color: #c8ebf5; }
+.status-off { background-color: alpha(#fff, 0.06); color: alpha(#ebe6f4, 0.55); }
+.status-miss { background-color: alpha(#c4a1ff, 0.12); color: #c4a1ff; }
+.footer {
+  background-color: alpha(#120f1a, 0.95);
+  border-top: 1px solid alpha(#fff, 0.06);
+  padding: 10px 14px;
+}
+.hint { opacity: 0.5; font-size: 0.82em; }
+"""
+
+CAT_ORDER = ["project", "plugin", "utility"]
+CAT_LABEL = {
+    "project": "PROJECTS",
+    "plugin": "PLUGINS",
+    "utility": "UTILITIES",
+}
+
+
+def run_ui() -> int:
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Adw, Gdk, GLib, Gtk, Pango  # type: ignore
+
+    class ProjectRow(Gtk.Box):
+        def __init__(self, proj: Project, on_change: Callable[[], None]):
+            super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            self.proj = proj
+            self.on_change = on_change
+            self._busy = False
+            self.add_css_class("mod-row")
+            self.set_hexpand(True)
+            self.set_size_request(0, -1)
+
+            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            left.set_hexpand(True)
+            left.set_size_request(0, -1)
+            self.name_lbl = Gtk.Label(label=proj.name, xalign=0)
+            self.name_lbl.add_css_class("mod-name")
+            self.name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            self.name_lbl.set_hexpand(True)
+            self.name_lbl.set_size_request(0, -1)
+            left.append(self.name_lbl)
+            self.desc_lbl = Gtk.Label(label=proj.desc, xalign=0, wrap=True)
+            self.desc_lbl.add_css_class("mod-desc")
+            self.desc_lbl.set_wrap(True)
+            self.desc_lbl.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            self.desc_lbl.set_hexpand(True)
+            self.desc_lbl.set_size_request(0, -1)
+            try:
+                self.desc_lbl.set_natural_wrap_mode(Gtk.NaturalWrapMode.NONE)
+            except Exception:
+                pass
+            left.append(self.desc_lbl)
+            self.meta_lbl = Gtk.Label(label="", xalign=0)
+            self.meta_lbl.add_css_class("mod-meta")
+            self.meta_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            self.meta_lbl.set_hexpand(True)
+            self.meta_lbl.set_size_request(0, -1)
+            left.append(self.meta_lbl)
+
+            # keybind cheat-sheet — stack key + action so narrow windows work
+            self.bind_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            self.bind_box.add_css_class("bind-block")
+            self.bind_box.set_hexpand(True)
+            self.bind_box.set_size_request(0, -1)
+            head = Gtk.Label(label="KEYBINDS", xalign=0)
+            head.add_css_class("bind-head")
+            head.set_size_request(0, -1)
+            self.bind_box.append(head)
+            if not proj.binds:
+                none = Gtk.Label(label="none — no keyboard binds", xalign=0)
+                none.add_css_class("bind-none")
+                none.set_ellipsize(Pango.EllipsizeMode.END)
+                none.set_size_request(0, -1)
+                self.bind_box.append(none)
+            else:
+                for when, group in proj.binds_by_when():
+                    wl = Gtk.Label(label=when, xalign=0, wrap=True)
+                    wl.add_css_class("bind-when")
+                    wl.set_wrap(True)
+                    wl.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                    wl.set_hexpand(True)
+                    wl.set_size_request(0, -1)
+                    try:
+                        wl.set_natural_wrap_mode(Gtk.NaturalWrapMode.NONE)
+                    except Exception:
+                        pass
+                    self.bind_box.append(wl)
+                    for b in group:
+                        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+                        row.add_css_class("bind-row")
+                        row.set_margin_bottom(4)
+                        row.set_size_request(0, -1)
+                        k = Gtk.Label(label=b.keys, xalign=0)
+                        k.add_css_class("bind-keys")
+                        k.set_ellipsize(Pango.EllipsizeMode.END)
+                        k.set_hexpand(True)
+                        k.set_size_request(0, -1)
+                        a = Gtk.Label(label=b.action, xalign=0, wrap=True)
+                        a.add_css_class("bind-action")
+                        a.set_wrap(True)
+                        a.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                        a.set_hexpand(True)
+                        a.set_size_request(0, -1)
+                        try:
+                            a.set_natural_wrap_mode(Gtk.NaturalWrapMode.NONE)
+                        except Exception:
+                            pass
+                        row.append(k)
+                        row.append(a)
+                        self.bind_box.append(row)
+            left.append(self.bind_box)
+            self.append(left)
+
+            right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            right.set_valign(Gtk.Align.START)
+            self.status = Gtk.Label()
+            self.status.add_css_class("status-dot")
+            self.status.set_halign(Gtk.Align.END)
+            right.append(self.status)
+
+            self.switch = Gtk.Switch()
+            self.switch.set_halign(Gtk.Align.END)
+            self.switch.set_tooltip_text(
+                "ON = wired into Hyprland\n"
+                "OFF = binds/boot removed (practically uninstalled)\n"
+                "If missing on disk, turning ON clones from GitHub first."
+            )
+            self.switch.connect("state-set", self._on_switch)
+            right.append(self.switch)
+
+            self.install_btn = Gtk.Button(label="Install from GitHub")
+            self.install_btn.add_css_class("suggested-action")
+            self.install_btn.set_halign(Gtk.Align.END)
+            self.install_btn.set_visible(False)
+            self.install_btn.connect("clicked", self._on_install)
+            right.append(self.install_btn)
+            self.append(right)
+            self.refresh()
+
+        def refresh(self) -> None:
+            self.remove_css_class("on")
+            self.remove_css_class("missing")
+            for c in ("status-on", "status-off", "status-miss"):
+                self.status.remove_css_class(c)
+
+            if not self.proj.on_disk():
+                self.add_css_class("missing")
+                self.status.set_label("missing")
+                self.status.add_css_class("status-miss")
+                self.switch.set_sensitive(False)
+                self.switch.handler_block_by_func(self._on_switch)
+                self.switch.set_state(False)
+                self.switch.set_active(False)
+                self.switch.handler_unblock_by_func(self._on_switch)
+                gh = self.proj.repo_slug()
+                if gh:
+                    self.meta_lbl.set_label(f"not on disk · github.com/{gh}")
+                    if self.install_btn:
+                        self.install_btn.set_visible(True)
+                        self.install_btn.set_sensitive(not self._busy)
+                else:
+                    self.meta_lbl.set_label("not on disk · local-only (no GitHub)")
+                    if self.install_btn:
+                        self.install_btn.set_visible(False)
+                return
+
+            if self.install_btn:
+                self.install_btn.set_visible(False)
+            on = is_enabled(self.proj.id)
+            self.status.set_label("WIRED" if on else "off")
+            self.status.add_css_class("status-on" if on else "status-off")
+            if on:
+                self.add_css_class("on")
+            act = self.proj.activity() if self.proj.activity else ""
+            n_keys = len(self.proj.binds)
+            key_bit = f"{n_keys} key" + ("" if n_keys == 1 else "s")
+            if n_keys == 0:
+                key_bit = "no keys"
+            self.meta_lbl.set_label(
+                f"id · {self.proj.id}  ·  {key_bit}"
+                + (f"  ·  {act}" if act else "")
+            )
+            self.switch.set_sensitive(not self._busy)
+            self.switch.handler_block_by_func(self._on_switch)
+            self.switch.set_state(on)
+            self.switch.set_active(on)
+            self.switch.handler_unblock_by_func(self._on_switch)
+
+        def _on_switch(self, switch: Gtk.Switch, state: bool) -> bool:
+            if self._busy:
+                return True
+            self._busy = True
+            switch.set_sensitive(False)
+            want = state
+
+            def work():
+                ok, msg = set_enabled(self.proj.id, want)
+                GLib.idle_add(self._done, ok, msg)
+
+            threading.Thread(target=work, daemon=True).start()
+            return True
+
+        def _on_install(self, *_a) -> None:
+            if self._busy:
+                return
+            self._busy = True
+            if self.install_btn:
+                self.install_btn.set_sensitive(False)
+                self.install_btn.set_label("Installing…")
+
+            def work():
+                ok, msg = install_from_github(self.proj.id)
+                if ok:
+                    # also wire it on after a fresh install
+                    ok2, msg2 = set_enabled(self.proj.id, True)
+                    msg = msg + "\n" + msg2
+                    ok = ok2
+                GLib.idle_add(self._done, ok, msg)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _done(self, ok: bool, msg: str) -> bool:
+            self._busy = False
+            if self.install_btn:
+                self.install_btn.set_label("Install from GitHub")
+            time.sleep(0.05)
+            self.refresh()
+            self.on_change()
+            notify(self.proj.name, (msg or "done")[:200])
+            if not ok:
+                pass
+            return False
+
+    def _soft_label(text: str = "", **kwargs) -> Gtk.Label:
+        """Label that does not force a huge window min-width."""
+        lab = Gtk.Label(label=text, xalign=0, **kwargs)
+        lab.set_wrap(True)
+        lab.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        try:
+            lab.set_natural_wrap_mode(Gtk.NaturalWrapMode.NONE)
+        except Exception:
+            pass
+        lab.set_hexpand(True)
+        # Zero min width so parent can shrink; wrap/ellipsize handles overflow
+        lab.set_size_request(0, -1)
+        return lab
+
+    class ManagerWindow(Adw.ApplicationWindow):
+        def __init__(self, app: Adw.Application):
+            super().__init__(application=app, title="hyprmods")
+            self.rows: list[ProjectRow] = []
+            self.set_default_size(520, 640)
+            self.set_resizable(True)
+            # Explicit tiny min — Hyprland otherwise clamps to GTK's content min
+            self.set_size_request(200, 120)
+
+            provider = Gtk.CssProvider()
+            provider.load_from_data(APP_CSS.encode())
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(),
+                provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+
+            # Entire UI inside one ScrolledWindow so the window min-size is
+            # the scroll viewport, not the sum of every project card.
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_propagate_natural_width(False)
+            scroll.set_propagate_natural_height(False)
+            scroll.set_min_content_width(200)
+            scroll.set_min_content_height(120)
+            scroll.set_hexpand(True)
+            scroll.set_vexpand(True)
+            self.set_content(scroll)
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            root.set_valign(Gtk.Align.START)
+            root.set_halign(Gtk.Align.FILL)
+            root.set_hexpand(True)
+            root.set_size_request(0, -1)
+            scroll.set_child(root)
+
+            header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            header.add_css_class("header-bar")
+            header.set_margin_top(16)
+            header.set_margin_bottom(12)
+            header.set_margin_start(18)
+            header.set_margin_end(18)
+            header.set_hexpand(True)
+            header.set_size_request(0, -1)
+
+            title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            title_row.set_hexpand(True)
+            t = _soft_label("hyprmods")
+            t.add_css_class("title-main")
+            t.set_ellipsize(Pango.EllipsizeMode.END)
+            t.set_wrap(False)
+            title_row.append(t)
+            self.theme_chip = Gtk.Label(label=f"theme · {current_theme()}")
+            self.theme_chip.add_css_class("chip")
+            self.theme_chip.set_ellipsize(Pango.EllipsizeMode.END)
+            self.theme_chip.set_size_request(0, -1)
+            title_row.append(self.theme_chip)
+            refresh = Gtk.Button(label="↻")
+            refresh.set_tooltip_text("Refresh")
+            refresh.connect("clicked", lambda *_: self.refresh_all())
+            title_row.append(refresh)
+            header.append(title_row)
+
+            sub = _soft_label(
+                "Toggle = wire into Hyprland · missing tools install from GitHub · keys listed per card"
+            )
+            sub.add_css_class("title-sub")
+            header.append(sub)
+            root.append(header)
+
+            list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            list_box.set_margin_start(14)
+            list_box.set_margin_end(14)
+            list_box.set_margin_bottom(8)
+            list_box.set_hexpand(True)
+            list_box.set_size_request(0, -1)
+            root.append(list_box)
+
+            by: dict[str, list[Project]] = {}
+            for p in PROJECTS:
+                by.setdefault(p.category, []).append(p)
+            for cat in CAT_ORDER:
+                if cat not in by:
+                    continue
+                sec = _soft_label(CAT_LABEL.get(cat, cat.upper()))
+                sec.add_css_class("section-label")
+                list_box.append(sec)
+                for p in by[cat]:
+                    row = ProjectRow(p, self._update_footer)
+                    row.set_size_request(0, -1)
+                    self.rows.append(row)
+                    list_box.append(row)
+
+            foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            foot.add_css_class("footer")
+            foot.set_hexpand(True)
+            foot.set_size_request(0, -1)
+            self.status = _soft_label("")
+            self.status.add_css_class("hint")
+            self.status.set_ellipsize(Pango.EllipsizeMode.END)
+            self.status.set_wrap(False)
+            foot.append(self.status)
+            apply_btn = Gtk.Button(label="Re-apply")
+            apply_btn.set_tooltip_text("Rewrite conf + hyprctl reload")
+            apply_btn.connect("clicked", self._apply)
+            foot.append(apply_btn)
+            menu_btn = Gtk.Button(label="Rofi")
+            menu_btn.connect(
+                "clicked",
+                lambda *_: threading.Thread(target=cmd_menu, daemon=True).start(),
+            )
+            foot.append(menu_btn)
+            root.append(foot)
+
+            key = Gtk.EventControllerKey()
+            key.connect("key-pressed", self._on_key)
+            self.add_controller(key)
+            self._update_footer()
+            GLib.timeout_add_seconds(3, self._tick)
+
+        def _tick(self) -> bool:
+            if self.is_visible():
+                for row in self.rows:
+                    if not row._busy:
+                        row.refresh()
+                self.theme_chip.set_label(f"theme · {current_theme()}")
+                self._update_footer()
+            return True
+
+        def refresh_all(self) -> None:
+            for row in self.rows:
+                row.refresh()
+            self.theme_chip.set_label(f"theme · {current_theme()}")
+            self._update_footer()
+
+        def _update_footer(self) -> None:
+            st = load_enabled()
+            on = [p.name for p in PROJECTS if st.get(p.id, True) and p.on_disk()]
+            off = [p.name for p in PROJECTS if not st.get(p.id, True) and p.on_disk()]
+            bits = []
+            if on:
+                bits.append(f"installed · {', '.join(on)}")
+            if off:
+                bits.append(f"off · {', '.join(off)}")
+            self.status.set_label("  ·  ".join(bits) or "nothing on disk")
+
+        def _apply(self, *_a) -> None:
+            def work():
+                ok, msg = apply_all()
+                GLib.idle_add(lambda: (self.refresh_all(), notify("hyprmods", msg), False)[-1])
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _on_key(self, _c, keyval, _code, state) -> bool:
+            if keyval == Gdk.KEY_Escape:
+                self.close()
+                return True
+            if keyval in (Gdk.KEY_r, Gdk.KEY_R):
+                self.refresh_all()
+                return True
+            if Gdk.KEY_1 <= keyval <= Gdk.KEY_9:
+                idx = keyval - Gdk.KEY_1
+                usable = [r for r in self.rows if r.proj.on_disk()]
+                if idx < len(usable):
+                    row = usable[idx]
+                    row.switch.set_active(not is_enabled(row.proj.id))
+                    return True
+            return False
+
+    class App(Adw.Application):
+        def __init__(self):
+            super().__init__(application_id="dev.beebit.Hyprmods")
+            self.window: Optional[ManagerWindow] = None
+
+        def do_activate(self):
+            # ensure wiring exists before UI
+            state = load_enabled()
+            write_generated(state)
+            ensure_hyprland_sources()
+            if not self.window:
+                self.window = ManagerWindow(self)
+            self.window.present()
+
+    Adw.init()
+    Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+    return App().run(sys.argv[:1])
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv: Optional[list[str]] = None) -> int:
+    argv = list(argv if argv is not None else sys.argv[1:])
+
+    # always keep conf generation possible
+    ensure_dirs()
+
+    parser = argparse.ArgumentParser(
+        prog="hyprmods",
+        description="Install/enable manager for Hyprland projects (not runtime modes).",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("ui", help="GTK manager (default)")
+    p_list = sub.add_parser("list", aliases=["status"], help="show install state")
+    p_list.add_argument("--plain", action="store_true")
+    sub.add_parser("ids")
+    p_tog = sub.add_parser("toggle", help="install ↔ uninstall a project")
+    p_tog.add_argument("project")
+    p_on = sub.add_parser("on", help="enable (install wiring)")
+    p_on.add_argument("project")
+    p_off = sub.add_parser("off", help="disable (uninstall wiring)")
+    p_off.add_argument("project")
+    sub.add_parser("menu", help="rofi/wofi picker")
+    sub.add_parser("apply", help="rewrite generated conf + reload")
+    sub.add_parser("migrate", help="strip legacy lines from hyprland.conf")
+    p_chk = sub.add_parser(
+        "check",
+        help="exit 0 if project is enabled (for other scripts)",
+    )
+    p_chk.add_argument("project")
+    p_ins = sub.add_parser(
+        "install",
+        help="clone from GitHub + install.sh if binaries missing",
+    )
+    p_ins.add_argument("project")
+    sub.add_parser(
+        "install-all",
+        help="install every missing project that has a GitHub repo",
+    )
+
+    if not argv:
+        return run_ui()
+
+    # shortcut: hyprmods winbar → toggle
+    if argv[0] not in {
+        "ui",
+        "list",
+        "status",
+        "ids",
+        "toggle",
+        "on",
+        "off",
+        "menu",
+        "apply",
+        "migrate",
+        "check",
+        "install",
+        "install-all",
+        "-h",
+        "--help",
+    }:
+        if get_project(argv[0]):
+            return cmd_toggle(argv[0])
+
+    args = parser.parse_args(argv)
+
+    if args.cmd in (None, "ui"):
+        return run_ui()
+    if args.cmd in ("list", "status"):
+        return cmd_list(plain=getattr(args, "plain", False))
+    if args.cmd == "ids":
+        for p in PROJECTS:
+            print(p.id)
+        return 0
+    if args.cmd == "toggle":
+        return cmd_toggle(args.project)
+    if args.cmd == "on":
+        return cmd_toggle(args.project, force=True)
+    if args.cmd == "off":
+        return cmd_toggle(args.project, force=False)
+    if args.cmd == "menu":
+        return cmd_menu()
+    if args.cmd == "apply":
+        ok, msg = apply_all()
+        print(msg)
+        return 0 if ok else 1
+    if args.cmd == "migrate":
+        state = load_enabled()
+        write_generated(state)
+        changed, msg = ensure_hyprland_sources()
+        hypr_reload()
+        print(msg)
+        print(f"generated {GENERATED}")
+        return 0
+    if args.cmd == "check":
+        p = get_project(args.project)
+        if not p:
+            return 2
+        return 0 if is_enabled(p.id) and p.on_disk() else 1
+    if args.cmd == "install":
+        ok, msg = install_from_github(args.project)
+        print(msg)
+        return 0 if ok else 1
+    if args.cmd == "install-all":
+        ok, msg = install_all_missing()
+        print(msg)
+        return 0 if ok else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
