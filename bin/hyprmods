@@ -1729,6 +1729,10 @@ def run_ui() -> int:
             self.status.set_ellipsize(Pango.EllipsizeMode.END)
             self.status.set_wrap(False)
             foot.append(self.status)
+            install_all_btn = Gtk.Button(label="Install missing")
+            install_all_btn.set_tooltip_text("Clone + install every missing GitHub project")
+            install_all_btn.connect("clicked", self._install_all)
+            foot.append(install_all_btn)
             apply_btn = Gtk.Button(label="Re-apply")
             apply_btn.set_tooltip_text("Rewrite conf + hyprctl reload")
             apply_btn.connect("clicked", self._apply)
@@ -1777,6 +1781,19 @@ def run_ui() -> int:
             def work():
                 ok, msg = apply_all()
                 GLib.idle_add(lambda: (self.refresh_all(), notify("hyprmods", msg), False)[-1])
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _install_all(self, *_a) -> None:
+            def work():
+                ok, msg = install_all_missing()
+                GLib.idle_add(
+                    lambda: (
+                        self.refresh_all(),
+                        notify("hyprmods", "install-all done" if ok else "install-all had errors"),
+                        False,
+                    )[-1]
+                )
 
             threading.Thread(target=work, daemon=True).start()
 
