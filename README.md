@@ -24,6 +24,7 @@ Needs `gh` auth for **private** repos (or SSH git remotes).
 
 | id | Repo |
 |----|------|
+| hyprmods | [rippelz/hyprmods](https://github.com/rippelz/hyprmods) (this tool) |
 | winbar | [rippelz/winbar](https://github.com/rippelz/winbar) |
 | infiniscroll | [rippelz/infiniscroll](https://github.com/rippelz/infiniscroll) |
 | hypr-nominsize | [rippelz/hypr-nominsize](https://github.com/rippelz/hypr-nominsize) |
@@ -40,10 +41,15 @@ Clones land in `~/.local/src/hyprmods/<repo>/` when not already installed.
 hyprmods list
 hyprmods install winbar
 hyprmods install-all
+hyprmods outdated           # projects with a newer GitHub tip
+hyprmods update winbar      # pull + re-run install.sh
+hyprmods update-all
 hyprmods off infiniscroll
 hyprmods on infiniscroll    # wires (and installs from GH if missing)
 hyprmods migrate
 ```
+
+`list` / the GUI check each project’s local git clone against GitHub (via `gh` when available). Cached for 5 minutes (`HYPRMODS_UPDATE_TTL`).
 
 **Super+Y** — GUI · **Super+Shift+Y** — rofi menu
 

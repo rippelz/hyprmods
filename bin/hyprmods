@@ -18,6 +18,8 @@ Usage:
   hyprmods on|off <id>
   hyprmods install <id>    clone from GitHub + run install.sh if missing
   hyprmods install-all     install every project that is not on disk
+  hyprmods update <id>     pull latest from GitHub + reinstall
+  hyprmods update-all      update every project that is behind GitHub
   hyprmods menu            rofi picker
   hyprmods apply           rewrite conf + reload (no state change)
   hyprmods migrate         strip legacy lines from hyprland.conf (once)
@@ -33,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -55,6 +58,8 @@ SRC_ROOT = Path(
     os.environ.get("HYPRMODS_SRC", HOME / ".local" / "src" / "hyprmods")
 )
 GITHUB_OWNER = os.environ.get("HYPRMODS_GITHUB_OWNER", "rippelz")
+# How long to cache GitHub update checks (seconds)
+UPDATE_CACHE_TTL = float(os.environ.get("HYPRMODS_UPDATE_TTL", "300"))
 
 
 # ---------------------------------------------------------------------------
@@ -561,8 +566,32 @@ def _rgb_activity() -> str:
     return ""
 
 
+def _hyprmods_activity() -> str:
+    """Live label for the manager row (version comes from update check)."""
+    return "manager"
+
+
 def build_projects() -> list[Project]:
     return [
+        Project(
+            id="hyprmods",
+            name="hyprmods",
+            desc="This manager — install, wire, update your Hyprland projects",
+            category="project",
+            source=str(HOME / "code" / "hyprmods"),
+            github="hyprmods",
+            requires=["hyprmods"],
+            conf_lines=[
+                "# hyprmods manager",
+                "bind = $mainMod, Y, exec, ~/.local/bin/hyprmods",
+                "bind = $mainMod SHIFT, Y, exec, ~/.local/bin/hyprmods menu",
+            ],
+            binds=[
+                kb("Super+Y", "open hyprmods GUI", "always (while installed)"),
+                kb("Super+Shift+Y", "rofi install menu", "always (while installed)"),
+            ],
+            activity=_hyprmods_activity,
+        ),
         Project(
             id="winbar",
             name="Winbar",
@@ -788,16 +817,355 @@ def build_projects() -> list[Project]:
 
 
 # ---------------------------------------------------------------------------
-# GitHub install
+# GitHub install + update checks
 # ---------------------------------------------------------------------------
 
-def clone_or_update(slug: str) -> tuple[bool, Path, str]:
-    """Clone github.com/slug into SRC_ROOT/<name>. Prefer `gh` for private repos."""
+def _fmt_ver(v: str) -> str:
+    """Pretty version for display (avoid vv0.1.0 when git describe already has v)."""
+    v = (v or "").strip()
+    if not v:
+        return ""
+    if v[0].isdigit():
+        return f"v{v}"
+    return v
+
+
+@dataclass
+class UpdateInfo:
+    """Result of comparing a local clone to its GitHub remote tip."""
+
+    slug: str
+    status: str  # up_to_date | update_available | ahead | diverged | no_local | no_github | error
+    local_sha: str = ""
+    remote_sha: str = ""
+    local_ver: str = ""
+    remote_ver: str = ""
+    detail: str = ""
+    repo_dir: str = ""
+
+    @property
+    def available(self) -> bool:
+        return self.status == "update_available"
+
+    def short_label(self) -> str:
+        lv = _fmt_ver(self.local_ver)
+        rv = _fmt_ver(self.remote_ver)
+        if self.status == "update_available":
+            if lv and rv and self.local_ver != self.remote_ver:
+                return f"↑ {lv} → {rv}"
+            if rv:
+                return f"↑ update · {rv}"
+            if self.remote_sha:
+                return f"↑ update · {self.remote_sha[:7]}"
+            return "↑ update available"
+        if self.status == "up_to_date":
+            return f"up to date · {lv}" if lv else "up to date"
+        if self.status == "ahead":
+            return f"local ahead · {lv}" if lv else "local ahead of GitHub"
+        if self.status == "diverged":
+            ls = lv or (self.local_sha[:7] if self.local_sha else "?")
+            rs = rv or (self.remote_sha[:7] if self.remote_sha else "?")
+            return f"diverged · local {ls} / remote {rs}"
+        if self.status == "error":
+            return f"check fail · {self.detail[:48]}" if self.detail else "check fail"
+        return ""
+
+
+# slug → (monotonic_ts, UpdateInfo)
+_update_cache: dict[str, tuple[float, UpdateInfo]] = {}
+_update_lock = threading.Lock()
+
+
+def _git_dir(path: Path) -> bool:
+    """True if path is a git work tree (regular .git dir or worktree file)."""
+    g = path / ".git"
+    return g.is_dir() or g.is_file()
+
+
+def find_repo_dir(p: Project) -> Optional[Path]:
+    """Locate a local git checkout for this project (dev tree or SRC_ROOT clone)."""
+    slug = p.repo_slug()
+    name = slug.split("/")[-1] if slug else p.id
+    candidates: list[Path] = []
+    if p.source:
+        src = Path(p.source).expanduser()
+        if src.is_dir():
+            candidates.append(src)
+        elif src.parent.is_dir():
+            candidates.append(src.parent)
+    candidates.extend(
+        [
+            SRC_ROOT / name,
+            HOME / "code" / name,
+        ]
+    )
+    seen: set[Path] = set()
+    for c in candidates:
+        try:
+            c = c.resolve()
+        except OSError:
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        cur = c
+        for _ in range(5):
+            if _git_dir(cur):
+                return cur
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+    return None
+
+
+def local_version(repo: Path) -> str:
+    for name in ("VERSION", "version"):
+        f = repo / name
+        if f.is_file():
+            try:
+                line = f.read_text(encoding="utf-8").strip().splitlines()
+                if line:
+                    return line[0].strip()
+            except OSError:
+                pass
+    code, out = run(
+        ["git", "-C", str(repo), "describe", "--tags", "--always"], timeout=10
+    )
+    return out.strip() if code == 0 and out else ""
+
+
+def local_sha(repo: Path) -> str:
+    code, out = run(["git", "-C", str(repo), "rev-parse", "HEAD"], timeout=10)
+    return out.strip() if code == 0 else ""
+
+
+def remote_head_sha(slug: str) -> tuple[str, str]:
+    """Return (full_sha, error). Prefer `gh` (private repos), else git ls-remote."""
+    if which("gh"):
+        code, out = run(
+            ["gh", "api", f"repos/{slug}", "--jq", ".default_branch"],
+            timeout=30,
+        )
+        branch = out.strip() if code == 0 and out.strip() else "main"
+        code, out = run(
+            ["gh", "api", f"repos/{slug}/commits/{branch}", "--jq", ".sha"],
+            timeout=30,
+        )
+        if code == 0 and out.strip():
+            return out.strip(), ""
+        # fall through — token/rate issues etc.
+    url = f"https://github.com/{slug}.git"
+    code, out = run(["git", "ls-remote", url, "HEAD"], timeout=30)
+    if code == 0 and out.strip():
+        return out.strip().split()[0], ""
+    return "", (out or f"could not reach github.com/{slug}")[:200]
+
+
+def remote_version(slug: str) -> str:
+    """Best-effort version string from GitHub (VERSION file, else latest tag)."""
+    if not which("gh"):
+        return ""
+    code, out = run(
+        ["gh", "api", f"repos/{slug}/contents/VERSION", "--jq", ".content"],
+        timeout=30,
+    )
+    if code == 0 and out.strip():
+        import base64
+
+        try:
+            # gh may return quoted JSON string content
+            raw = out.strip().strip('"')
+            text = base64.b64decode(raw).decode("utf-8").strip()
+            if text:
+                return text.splitlines()[0].strip()
+        except Exception:
+            pass
+    code, out = run(
+        ["gh", "api", f"repos/{slug}/tags", "--jq", ".[0].name"],
+        timeout=30,
+    )
+    if code == 0 and out.strip():
+        return out.strip().lstrip("v")
+    return ""
+
+
+def compare_local_to_remote(slug: str, local: str, remote: str) -> str:
+    """Map GitHub compare status onto our labels.
+
+    compare base...head with base=local, head=remote:
+      identical → up_to_date
+      ahead     → remote has new commits → update_available
+      behind    → local has commits remote lacks → ahead
+      diverged  → diverged
+    """
+    if local == remote:
+        return "up_to_date"
+    if which("gh"):
+        code, out = run(
+            [
+                "gh",
+                "api",
+                f"repos/{slug}/compare/{local}...{remote}",
+                "--jq",
+                ".status",
+            ],
+            timeout=30,
+        )
+        st = out.strip() if code == 0 else ""
+        if st == "identical":
+            return "up_to_date"
+        if st == "ahead":
+            return "update_available"
+        if st == "behind":
+            return "ahead"
+        if st == "diverged":
+            return "diverged"
+    # no gh / compare failed — treat any SHA mismatch as possible update
+    return "update_available"
+
+
+def invalidate_update_cache(slug: Optional[str] = None) -> None:
+    with _update_lock:
+        if slug is None:
+            _update_cache.clear()
+        else:
+            _update_cache.pop(slug, None)
+
+
+def check_update_for_slug(
+    slug: str,
+    repo: Optional[Path],
+    *,
+    force: bool = False,
+) -> UpdateInfo:
+    if not slug:
+        return UpdateInfo(slug="", status="no_github")
+
+    now = time.monotonic()
+    with _update_lock:
+        if not force and slug in _update_cache:
+            ts, info = _update_cache[slug]
+            if now - ts < UPDATE_CACHE_TTL:
+                return info
+
+    if not repo or not _git_dir(repo):
+        info = UpdateInfo(slug=slug, status="no_local", detail="no local clone")
+        with _update_lock:
+            _update_cache[slug] = (now, info)
+        return info
+
+    lsha = local_sha(repo)
+    lver = local_version(repo)
+    if not lsha:
+        info = UpdateInfo(
+            slug=slug,
+            status="error",
+            detail="not a git checkout",
+            local_ver=lver,
+            repo_dir=str(repo),
+        )
+        with _update_lock:
+            _update_cache[slug] = (now, info)
+        return info
+
+    rsha, err = remote_head_sha(slug)
+    if not rsha:
+        info = UpdateInfo(
+            slug=slug,
+            status="error",
+            detail=err or "remote unreachable",
+            local_sha=lsha,
+            local_ver=lver,
+            repo_dir=str(repo),
+        )
+        with _update_lock:
+            _update_cache[slug] = (now, info)
+        return info
+
+    status = compare_local_to_remote(slug, lsha, rsha)
+    rver = lver if status == "up_to_date" else (remote_version(slug) or "")
+    info = UpdateInfo(
+        slug=slug,
+        status=status,
+        local_sha=lsha,
+        remote_sha=rsha,
+        local_ver=lver,
+        remote_ver=rver,
+        repo_dir=str(repo),
+    )
+    with _update_lock:
+        _update_cache[slug] = (now, info)
+    return info
+
+
+def check_update(p: Project, *, force: bool = False) -> UpdateInfo:
+    slug = p.repo_slug()
+    if not slug:
+        return UpdateInfo(slug="", status="no_github")
+    return check_update_for_slug(slug, find_repo_dir(p), force=force)
+
+
+def check_all_updates(*, force: bool = False) -> dict[str, UpdateInfo]:
+    """project id → UpdateInfo. One network check per unique GitHub slug."""
+    by_slug: dict[str, list[Project]] = {}
+    for p in PROJECTS:
+        slug = p.repo_slug()
+        if not slug:
+            continue
+        by_slug.setdefault(slug, []).append(p)
+
+    slug_info: dict[str, UpdateInfo] = {}
+
+    def _one(slug: str) -> tuple[str, UpdateInfo]:
+        # prefer a project that has a resolvable local tree
+        repo: Optional[Path] = None
+        for p in by_slug[slug]:
+            repo = find_repo_dir(p)
+            if repo:
+                break
+        return slug, check_update_for_slug(slug, repo, force=force)
+
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(by_slug)))) as pool:
+        futs = [pool.submit(_one, s) for s in by_slug]
+        for fut in as_completed(futs):
+            slug, info = fut.result()
+            slug_info[slug] = info
+
+    out: dict[str, UpdateInfo] = {}
+    for p in PROJECTS:
+        slug = p.repo_slug()
+        if not slug:
+            out[p.id] = UpdateInfo(slug="", status="no_github")
+        else:
+            out[p.id] = slug_info.get(
+                slug, UpdateInfo(slug=slug, status="unknown")
+            )
+    return out
+
+
+def cached_update(p: Project) -> Optional[UpdateInfo]:
+    """Return cached UpdateInfo if present and fresh; else None (no network)."""
+    slug = p.repo_slug()
+    if not slug:
+        return UpdateInfo(slug="", status="no_github")
+    now = time.monotonic()
+    with _update_lock:
+        hit = _update_cache.get(slug)
+        if not hit:
+            return None
+        ts, info = hit
+        if now - ts >= UPDATE_CACHE_TTL:
+            return None
+        return info
+
+
+def clone_or_update(slug: str, dest: Optional[Path] = None) -> tuple[bool, Path, str]:
+    """Clone github.com/slug into dest (default SRC_ROOT/<name>). Prefer `gh`."""
     name = slug.split("/")[-1]
-    dest = SRC_ROOT / name
+    dest = dest or (SRC_ROOT / name)
     SRC_ROOT.mkdir(parents=True, exist_ok=True)
 
-    if (dest / ".git").is_dir():
+    if _git_dir(dest):
         code, out = run(["git", "-C", str(dest), "pull", "--ff-only"], timeout=120)
         if code != 0:
             # still usable if pull fails (offline etc.)
@@ -813,12 +1181,12 @@ def clone_or_update(slug: str) -> tuple[bool, Path, str]:
             ["gh", "repo", "clone", slug, str(dest)],
             timeout=300,
         )
-        if code == 0 and (dest / ".git").is_dir():
+        if code == 0 and _git_dir(dest):
             return True, dest, f"cloned {slug} → {dest}"
 
     url = f"https://github.com/{slug}.git"
     code, out = run(["git", "clone", url, str(dest)], timeout=300)
-    if code != 0 or not (dest / ".git").is_dir():
+    if code != 0 or not _git_dir(dest):
         return False, dest, out or f"clone failed: {slug}"
     return True, dest, f"cloned {slug} → {dest}"
 
@@ -855,12 +1223,92 @@ def install_from_github(pid: str) -> tuple[bool, str]:
     if not ok2:
         return False, f"{p.name}: clone ok ({msg}); install failed: {msg2}"
 
+    invalidate_update_cache(slug)
     if not p.on_disk():
         return False, (
             f"{p.name}: install finished but still not detected "
             f"(expected: {', '.join(p.requires) or '—'}). {msg2}"
         )
     return True, f"{p.name} installed from github.com/{slug}\n{msg}\n{msg2}"
+
+
+def update_from_github(pid: str) -> tuple[bool, str]:
+    """Pull latest from GitHub (existing clone preferred) and re-run install.sh."""
+    p = get_project(pid)
+    if not p:
+        return False, f"unknown project: {pid}"
+    slug = p.repo_slug()
+    if not slug:
+        return False, f"{p.name}: no GitHub repo configured (local-only)"
+
+    repo = find_repo_dir(p)
+    if repo:
+        ok, dest, msg = clone_or_update(slug, dest=repo)
+    else:
+        ok, dest, msg = clone_or_update(slug)
+    if not ok:
+        return False, f"{p.name}: {msg}"
+
+    ok2, msg2 = run_install_script(dest)
+    invalidate_update_cache(slug)
+    if not ok2:
+        return False, f"{p.name}: pull ok ({msg}); install failed: {msg2}"
+
+    # Refresh live state if currently wired (plugins/daemons)
+    if is_enabled(p.id) and p.on_disk() and p.on_enable:
+        try:
+            p.on_enable()
+        except Exception as e:
+            return True, (
+                f"{p.name} updated from github.com/{slug}\n{msg}\n{msg2}\n"
+                f"(re-activate warn: {e})"
+            )
+    return True, f"{p.name} updated from github.com/{slug}\n{msg}\n{msg2}"
+
+
+def update_all_available(*, only_outdated: bool = True) -> tuple[bool, str]:
+    """Pull + reinstall every (outdated) GitHub project. De-dupes monorepos."""
+    checks = check_all_updates(force=True) if only_outdated else {}
+    lines: list[str] = []
+    seen_slugs: set[str] = set()
+    any_fail = False
+    for p in PROJECTS:
+        slug = p.repo_slug()
+        if not slug:
+            lines.append(f"· {p.id}: skip (no github / local-only)")
+            continue
+        if only_outdated:
+            info = checks.get(p.id)
+            if not info or not info.available:
+                if info and info.status == "up_to_date":
+                    lines.append(f"· {p.id}: already up to date")
+                elif info and info.status == "no_local":
+                    lines.append(f"· {p.id}: no local clone (install first)")
+                elif info and info.status == "no_github":
+                    lines.append(f"· {p.id}: skip (no github / local-only)")
+                elif info:
+                    label = info.short_label() or info.status
+                    lines.append(f"· {p.id}: {label}")
+                else:
+                    lines.append(f"· {p.id}: skip")
+                continue
+        if slug in seen_slugs:
+            # monorepo already pulled — reinstall this unit if install.sh is shared
+            dest = find_repo_dir(p) or (SRC_ROOT / slug.split("/")[-1])
+            if dest.is_dir() and (dest / "install.sh").is_file():
+                ok, msg = run_install_script(dest)
+                lines.append(f"· {p.id}: re-install after {slug} pull · {msg}")
+                if not ok:
+                    any_fail = True
+            else:
+                lines.append(f"· {p.id}: covered by {slug}")
+            continue
+        seen_slugs.add(slug)
+        ok, msg = update_from_github(p.id)
+        lines.append(f"· {p.id}: {msg}")
+        if not ok:
+            any_fail = True
+    return (not any_fail), "\n".join(lines)
 
 
 def install_all_missing() -> tuple[bool, str]:
@@ -906,6 +1354,9 @@ def get_project(key: str) -> Optional[Project]:
         return PROJECT_BY_ID[k]
     # aliases
     aliases = {
+        "self": "hyprmods",
+        "manager": "hyprmods",
+        "me": "hyprmods",
         "winmode": "winbar",
         "win": "winbar",
         "infini": "infiniscroll",
@@ -949,16 +1400,22 @@ def render_generated(state: dict[str, bool]) -> str:
             continue
         lines.extend(p.conf_lines)
         lines.append("")
-    # always keep manager accessible
-    lines.extend(
-        [
-            "# hyprmods manager (always on)",
-            "bind = $mainMod, Y, exec, ~/.local/bin/hyprmods",
-            "bind = $mainMod SHIFT, Y, exec, ~/.local/bin/hyprmods menu",
-            MARKER_END,
-            "",
-        ]
+    # Super+Y lives on the hyprmods project. If that unit is missing/off,
+    # still inject binds so the manager stays reachable.
+    hm = next((p for p in PROJECTS if p.id == "hyprmods"), None)
+    hm_wired = bool(
+        hm and state.get("hyprmods", True) and hm.on_disk() and hm.conf_lines
     )
+    if not hm_wired:
+        lines.extend(
+            [
+                "# hyprmods manager (fallback — `hyprmods on hyprmods` to own these)",
+                "bind = $mainMod, Y, exec, ~/.local/bin/hyprmods",
+                "bind = $mainMod SHIFT, Y, exec, ~/.local/bin/hyprmods menu",
+                "",
+            ]
+        )
+    lines.extend([MARKER_END, ""])
     return "\n".join(lines)
 
 
@@ -1162,21 +1619,36 @@ def format_binds_block(p: Project, *, indent: str = "         ") -> list[str]:
     return lines
 
 
-def cmd_list(plain: bool = False) -> int:
+def cmd_list(plain: bool = False, *, check_updates: bool = True) -> int:
     state = load_enabled()
+    updates: dict[str, UpdateInfo] = {}
+    if check_updates:
+        try:
+            updates = check_all_updates(force=False)
+        except Exception:
+            updates = {}
+
     if plain:
         for p in PROJECTS:
             en = "on" if state.get(p.id, True) and p.on_disk() else "off"
             if not p.on_disk():
                 en = "missing"
-            print(f"{p.id}\t{en}\t{p.name}")
+            upd = updates.get(p.id)
+            ver = ""
+            if upd and upd.available:
+                ver = "update"
+            elif upd and upd.local_ver:
+                ver = upd.local_ver
+            print(f"{p.id}\t{en}\t{p.name}\t{ver}")
         return 0
 
     print(f"hyprmods · install manager · theme {current_theme()}")
     print(f"state  {ENABLED_FILE}")
     print(f"conf   {GENERATED}")
     print()
+    n_upd = 0
     for p in PROJECTS:
+        upd = updates.get(p.id)
         if not p.on_disk():
             mark = "✗ miss"
             gh = p.repo_slug()
@@ -1188,13 +1660,26 @@ def cmd_list(plain: bool = False) -> int:
         else:
             mark = "○ off"
             tag = "unwired"
+        if upd and upd.available:
+            n_upd += 1
+            mark = "↑ UPD"
+            extra = upd.short_label()
+            tag = f"{extra} · {tag}" if tag else extra
+        elif upd and upd.local_ver and p.on_disk():
+            fv = _fmt_ver(upd.local_ver)
+            # avoid "v0.1.1 · v0.1.1" when activity already shows the version
+            if fv and fv not in (tag or ""):
+                tag = f"{tag} · {fv}" if tag else fv
         print(f"  {mark}  {p.id:<16}  {p.name:<18}  {tag}")
         print(f"         {p.desc}")
         for line in format_binds_block(p):
             print(line)
         print()
     print("  toggle = wire/unwire Hyprland  ·  install = clone from GitHub if missing")
-    print("  hyprmods install winbar · hyprmods install-all · hyprmods")
+    if n_upd:
+        print(f"  {n_upd} update(s) available · hyprmods update <id> · hyprmods update-all")
+    else:
+        print("  hyprmods install winbar · hyprmods update-all · hyprmods")
     return 0
 
 
@@ -1214,10 +1699,17 @@ def cmd_toggle(target: str, force: Optional[bool] = None) -> int:
 
 def cmd_menu() -> int:
     state = load_enabled()
+    try:
+        updates = check_all_updates(force=False)
+    except Exception:
+        updates = {}
     lines = []
     for p in PROJECTS:
+        upd = updates.get(p.id)
         if not p.on_disk():
             tag = "[miss]"
+        elif upd and upd.available:
+            tag = "[UPD]"
         elif state.get(p.id, True):
             tag = "[ON] "
         else:
@@ -1378,6 +1870,8 @@ window { background-color: #0c0a12; }
 .status-on { background-color: alpha(#7ec8e3, 0.22); color: #c8ebf5; }
 .status-off { background-color: alpha(#fff, 0.06); color: alpha(#ebe6f4, 0.55); }
 .status-miss { background-color: alpha(#c4a1ff, 0.12); color: #c4a1ff; }
+.status-upd { background-color: alpha(#f0c674, 0.22); color: #f0c674; }
+.mod-row.update { border-color: alpha(#f0c674, 0.5); }
 .footer {
   background-color: alpha(#120f1a, 0.95);
   border-top: 1px solid alpha(#fff, 0.06);
@@ -1516,14 +2010,27 @@ def run_ui() -> int:
             self.install_btn.set_visible(False)
             self.install_btn.connect("clicked", self._on_install)
             right.append(self.install_btn)
+
+            self.update_btn = Gtk.Button(label="Update")
+            self.update_btn.add_css_class("suggested-action")
+            self.update_btn.set_halign(Gtk.Align.END)
+            self.update_btn.set_visible(False)
+            self.update_btn.set_tooltip_text(
+                "Pull latest from GitHub and re-run install.sh"
+            )
+            self.update_btn.connect("clicked", self._on_update)
+            right.append(self.update_btn)
             self.append(right)
             self.refresh()
 
         def refresh(self) -> None:
             self.remove_css_class("on")
             self.remove_css_class("missing")
-            for c in ("status-on", "status-off", "status-miss"):
+            self.remove_css_class("update")
+            for c in ("status-on", "status-off", "status-miss", "status-upd"):
                 self.status.remove_css_class(c)
+
+            upd = cached_update(self.proj)
 
             if not self.proj.on_disk():
                 self.add_css_class("missing")
@@ -1535,6 +2042,8 @@ def run_ui() -> int:
                 self.switch.set_active(False)
                 self.switch.handler_unblock_by_func(self._on_switch)
                 gh = self.proj.repo_slug()
+                if self.update_btn:
+                    self.update_btn.set_visible(False)
                 if gh:
                     self.meta_lbl.set_label(f"not on disk · github.com/{gh}")
                     if self.install_btn:
@@ -1549,19 +2058,34 @@ def run_ui() -> int:
             if self.install_btn:
                 self.install_btn.set_visible(False)
             on = is_enabled(self.proj.id)
-            self.status.set_label("WIRED" if on else "off")
-            self.status.add_css_class("status-on" if on else "status-off")
-            if on:
+            has_upd = bool(upd and upd.available)
+            if has_upd:
+                self.add_css_class("update")
+                self.status.set_label("UPDATE")
+                self.status.add_css_class("status-upd")
+            else:
+                self.status.set_label("WIRED" if on else "off")
+                self.status.add_css_class("status-on" if on else "status-off")
+            if on and not has_upd:
                 self.add_css_class("on")
             act = self.proj.activity() if self.proj.activity else ""
             n_keys = len(self.proj.binds)
             key_bit = f"{n_keys} key" + ("" if n_keys == 1 else "s")
             if n_keys == 0:
                 key_bit = "no keys"
-            self.meta_lbl.set_label(
-                f"id · {self.proj.id}  ·  {key_bit}"
-                + (f"  ·  {act}" if act else "")
-            )
+            bits = [f"id · {self.proj.id}", key_bit]
+            if act:
+                bits.append(act)
+            if upd and upd.available:
+                bits.append(upd.short_label())
+            elif upd and upd.local_ver:
+                bits.append(_fmt_ver(upd.local_ver))
+            self.meta_lbl.set_label("  ·  ".join(bits))
+            if self.update_btn:
+                self.update_btn.set_visible(has_upd)
+                self.update_btn.set_sensitive(not self._busy and has_upd)
+                if not self._busy:
+                    self.update_btn.set_label("Update")
             self.switch.set_sensitive(not self._busy)
             self.switch.handler_block_by_func(self._on_switch)
             self.switch.set_state(on)
@@ -1601,10 +2125,26 @@ def run_ui() -> int:
 
             threading.Thread(target=work, daemon=True).start()
 
+        def _on_update(self, *_a) -> None:
+            if self._busy:
+                return
+            self._busy = True
+            if self.update_btn:
+                self.update_btn.set_sensitive(False)
+                self.update_btn.set_label("Updating…")
+
+            def work():
+                ok, msg = update_from_github(self.proj.id)
+                GLib.idle_add(self._done, ok, msg)
+
+            threading.Thread(target=work, daemon=True).start()
+
         def _done(self, ok: bool, msg: str) -> bool:
             self._busy = False
             if self.install_btn:
                 self.install_btn.set_label("Install from GitHub")
+            if self.update_btn:
+                self.update_btn.set_label("Update")
             time.sleep(0.05)
             self.refresh()
             self.on_change()
@@ -1691,7 +2231,7 @@ def run_ui() -> int:
             header.append(title_row)
 
             sub = _soft_label(
-                "Toggle = wire into Hyprland · missing tools install from GitHub · keys listed per card"
+                "Toggle = wire into Hyprland · ↑ = newer version on GitHub · keys listed per card"
             )
             sub.add_css_class("title-sub")
             header.append(sub)
@@ -1733,6 +2273,12 @@ def run_ui() -> int:
             install_all_btn.set_tooltip_text("Clone + install every missing GitHub project")
             install_all_btn.connect("clicked", self._install_all)
             foot.append(install_all_btn)
+            self.update_all_btn = Gtk.Button(label="Update all")
+            self.update_all_btn.set_tooltip_text(
+                "Pull + reinstall every project with a newer GitHub version"
+            )
+            self.update_all_btn.connect("clicked", self._update_all)
+            foot.append(self.update_all_btn)
             apply_btn = Gtk.Button(label="Re-apply")
             apply_btn.set_tooltip_text("Rewrite conf + hyprctl reload")
             apply_btn.connect("clicked", self._apply)
@@ -1749,6 +2295,7 @@ def run_ui() -> int:
             key.connect("key-pressed", self._on_key)
             self.add_controller(key)
             self._update_footer()
+            self._check_updates_async(force=False)
             GLib.timeout_add_seconds(3, self._tick)
 
         def _tick(self) -> bool:
@@ -1760,22 +2307,57 @@ def run_ui() -> int:
                 self._update_footer()
             return True
 
+        def _check_updates_async(self, *, force: bool = False) -> None:
+            """Background GitHub version check; refreshes rows when done."""
+
+            def work():
+                try:
+                    check_all_updates(force=force)
+                except Exception:
+                    pass
+                GLib.idle_add(self._after_update_check)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _after_update_check(self) -> bool:
+            for row in self.rows:
+                if not row._busy:
+                    row.refresh()
+            self._update_footer()
+            return False
+
         def refresh_all(self) -> None:
             for row in self.rows:
                 row.refresh()
             self.theme_chip.set_label(f"theme · {current_theme()}")
             self._update_footer()
+            self._check_updates_async(force=True)
 
         def _update_footer(self) -> None:
             st = load_enabled()
             on = [p.name for p in PROJECTS if st.get(p.id, True) and p.on_disk()]
             off = [p.name for p in PROJECTS if not st.get(p.id, True) and p.on_disk()]
+            n_upd = 0
+            upd_names: list[str] = []
+            seen_slugs: set[str] = set()
+            for p in PROJECTS:
+                info = cached_update(p)
+                if info and info.available and info.slug not in seen_slugs:
+                    seen_slugs.add(info.slug)
+                    n_upd += 1
+                    upd_names.append(p.name)
             bits = []
+            if n_upd:
+                bits.append(f"↑ {n_upd} update" + ("s" if n_upd != 1 else ""))
+                if len(upd_names) <= 4:
+                    bits[-1] += f" · {', '.join(upd_names)}"
             if on:
                 bits.append(f"installed · {', '.join(on)}")
             if off:
                 bits.append(f"off · {', '.join(off)}")
             self.status.set_label("  ·  ".join(bits) or "nothing on disk")
+            if hasattr(self, "update_all_btn"):
+                self.update_all_btn.set_sensitive(n_upd > 0)
 
         def _apply(self, *_a) -> None:
             def work():
@@ -1794,6 +2376,26 @@ def run_ui() -> int:
                         False,
                     )[-1]
                 )
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _update_all(self, *_a) -> None:
+            if hasattr(self, "update_all_btn"):
+                self.update_all_btn.set_sensitive(False)
+                self.update_all_btn.set_label("Updating…")
+
+            def work():
+                ok, msg = update_all_available(only_outdated=True)
+                def done():
+                    if hasattr(self, "update_all_btn"):
+                        self.update_all_btn.set_label("Update all")
+                    self.refresh_all()
+                    notify(
+                        "hyprmods",
+                        "updates done" if ok else "update-all had errors",
+                    )
+                    return False
+                GLib.idle_add(done)
 
             threading.Thread(target=work, daemon=True).start()
 
@@ -1874,6 +2476,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         "install-all",
         help="install every missing project that has a GitHub repo",
     )
+    p_upd = sub.add_parser(
+        "update",
+        help="pull latest from GitHub + re-run install.sh",
+    )
+    p_upd.add_argument("project")
+    sub.add_parser(
+        "update-all",
+        help="update every project that is behind its GitHub remote",
+    )
+    p_outdated = sub.add_parser(
+        "outdated",
+        help="list projects with a newer version on GitHub",
+    )
+    p_outdated.add_argument(
+        "--plain", action="store_true", help="id\\tlocal\\tremote per line"
+    )
 
     if not argv:
         return run_ui()
@@ -1893,6 +2511,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         "check",
         "install",
         "install-all",
+        "update",
+        "update-all",
+        "outdated",
         "-h",
         "--help",
     }:
@@ -1942,6 +2563,40 @@ def main(argv: Optional[list[str]] = None) -> int:
         ok, msg = install_all_missing()
         print(msg)
         return 0 if ok else 1
+    if args.cmd == "update":
+        ok, msg = update_from_github(args.project)
+        print(msg)
+        return 0 if ok else 1
+    if args.cmd == "update-all":
+        ok, msg = update_all_available(only_outdated=True)
+        print(msg)
+        return 0 if ok else 1
+    if args.cmd == "outdated":
+        updates = check_all_updates(force=True)
+        plain = getattr(args, "plain", False)
+        n = 0
+        seen: set[str] = set()
+        for p in PROJECTS:
+            info = updates.get(p.id)
+            if not info or not info.available:
+                continue
+            if info.slug in seen:
+                continue
+            seen.add(info.slug)
+            n += 1
+            if plain:
+                print(
+                    f"{p.id}\t{info.local_ver or info.local_sha[:7]}\t"
+                    f"{info.remote_ver or info.remote_sha[:7]}\t{info.slug}"
+                )
+            else:
+                print(f"  ↑  {p.id:<16}  {info.short_label()}  ({info.slug})")
+        if not plain:
+            if n == 0:
+                print("all checked projects are up to date")
+            else:
+                print(f"\n{n} repo(s) behind GitHub · hyprmods update-all")
+        return 0 if n == 0 else 1
     return 0
 
 
