@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hyprmods — install/enable manager for your Hyprland projects.
+"""hyprmods - install/enable manager for your Hyprland projects.
 
 This is NOT a runtime mode switcher (Super+W still does that for winmode).
 Toggling a project here wires or unwires it from Hyprland:
@@ -148,9 +148,9 @@ def plugin_unload(name: str) -> None:
 
 def current_theme() -> str:
     try:
-        return THEME_CURRENT.read_text(encoding="utf-8").strip() or "—"
+        return THEME_CURRENT.read_text(encoding="utf-8").strip() or "-"
     except OSError:
-        return "—"
+        return "-"
 
 
 def ensure_dirs() -> None:
@@ -200,7 +200,7 @@ def is_enabled(pid: str, state: Optional[dict[str, bool]] = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# project registry — install units
+# project registry - install units
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -231,11 +231,11 @@ class Project:
     binds: list[Keybind] = field(default_factory=list)
     # optional: required binaries (any missing → show as not installed on disk)
     requires: list[str] = field(default_factory=list)
-    # called when flipping OFF — stop daemons, clear mode, unload plugins
+    # called when flipping OFF - stop daemons, clear mode, unload plugins
     on_disable: Optional[Callable[[], None]] = None
-    # called when flipping ON — start boot helpers for this session
+    # called when flipping ON - start boot helpers for this session
     on_enable: Optional[Callable[[], None]] = None
-    # live activity (informational only — mode currently running)
+    # live activity (informational only - mode currently running)
     activity: Optional[Callable[[], str]] = None
 
     def on_disk(self) -> bool:
@@ -266,7 +266,7 @@ class Project:
 def _empty_mode_conf() -> None:
     p = HYPR_DIR / "mode.conf"
     p.write_text(
-        "# Managed by winmode — currently OFF (hyprmods disabled winbar).\n",
+        "# Managed by winmode - currently OFF (hyprmods disabled winbar).\n",
         encoding="utf-8",
     )
 
@@ -274,7 +274,7 @@ def _empty_mode_conf() -> None:
 def _empty_infini_conf() -> None:
     p = HYPR_DIR / "infini.conf"
     p.write_text(
-        "# Managed by infiniscroll — currently OFF (hyprmods disabled infiniscroll).\n",
+        "# Managed by infiniscroll - currently OFF (hyprmods disabled infiniscroll).\n",
         encoding="utf-8",
     )
 
@@ -369,7 +369,7 @@ def _infini_activity() -> str:
 
 
 def _disable_theme() -> None:
-    # Keep applied colors/wallpaper — only unwire Super+T.
+    # Keep applied colors/wallpaper - only unwire Super+T.
     pass
 
 
@@ -497,7 +497,7 @@ def _disable_autoclicker() -> None:
 
 
 def _enable_autoclicker() -> None:
-    # Interactive TUI — user launches with `autoclicker`. Nothing to boot.
+    # Interactive TUI - user launches with `autoclicker`. Nothing to boot.
     pass
 
 
@@ -576,7 +576,7 @@ def build_projects() -> list[Project]:
         Project(
             id="hyprmods",
             name="hyprmods",
-            desc="This manager — install, wire, update your Hyprland projects",
+            desc="This manager - install, wire, update your Hyprland projects",
             category="project",
             source=str(HOME / "code" / "hyprmods"),
             github="hyprmods",
@@ -595,7 +595,7 @@ def build_projects() -> list[Project]:
         Project(
             id="winbar",
             name="Winbar",
-            desc="Windows desktop mode — taskbar, start menu, desktop icons",
+            desc="Windows desktop mode - taskbar, start menu, desktop icons",
             category="project",
             source=str(HOME / "code" / "winbar"),
             github="winbar",
@@ -626,7 +626,7 @@ def build_projects() -> list[Project]:
         Project(
             id="infiniscroll",
             name="Infiniscroll",
-            desc="Infinite-canvas desktops — pan, zoom, cluster",
+            desc="Infinite-canvas desktops - pan, zoom, cluster",
             category="project",
             source=str(HOME / "code" / "infiniscroll"),
             github="infiniscroll",
@@ -659,7 +659,7 @@ def build_projects() -> list[Project]:
             desc="theme + theme-ui gallery (applied look stays in theme.conf)",
             category="project",
             source=str(HOME / ".config" / "themes"),
-            github="",  # personal theme store — not published
+            github="",  # personal theme store - not published
             requires=["theme-ui"],
             conf_lines=[
                 "# theme switcher",
@@ -670,7 +670,7 @@ def build_projects() -> list[Project]:
             ],
             on_disable=_disable_theme,
             on_enable=_enable_theme,
-            activity=lambda: f"now · {current_theme()}" if current_theme() != "—" else "",
+            activity=lambda: f"now · {current_theme()}" if current_theme() != "-" else "",
         ),
         Project(
             id="wallpaper-boot",
@@ -722,7 +722,7 @@ def build_projects() -> list[Project]:
             github="autoclicker",
             requires=["autoclicker"],
             conf_lines=[
-                "# autoclicker — no Hyprland binds (hotkey via evdev while process runs)",
+                "# autoclicker - no Hyprland binds (hotkey via evdev while process runs)",
             ],
             binds=[
                 kb(
@@ -793,7 +793,7 @@ def build_projects() -> list[Project]:
             github="winbar",  # built by winbar install.sh
             requires=["hypr-minimize"],
             conf_lines=[
-                "# hypr-minimize — winmode-boot also loads this when winbar is on",
+                "# hypr-minimize - winmode-boot also loads this when winbar is on",
             ],
             binds=[],
             on_disable=_disable_minimize,
@@ -953,7 +953,7 @@ def remote_head_sha(slug: str) -> tuple[str, str]:
         )
         if code == 0 and out.strip():
             return out.strip(), ""
-        # fall through — token/rate issues etc.
+        # fall through - token/rate issues etc.
     url = f"https://github.com/{slug}.git"
     code, out = run(["git", "ls-remote", url, "HEAD"], timeout=30)
     if code == 0 and out.strip():
@@ -1020,7 +1020,7 @@ def compare_local_to_remote(slug: str, local: str, remote: str) -> str:
             return "ahead"
         if st == "diverged":
             return "diverged"
-    # no gh / compare failed — treat any SHA mismatch as possible update
+    # no gh / compare failed - treat any SHA mismatch as possible update
     return "update_available"
 
 
@@ -1227,7 +1227,7 @@ def install_from_github(pid: str) -> tuple[bool, str]:
     if not p.on_disk():
         return False, (
             f"{p.name}: install finished but still not detected "
-            f"(expected: {', '.join(p.requires) or '—'}). {msg2}"
+            f"(expected: {', '.join(p.requires) or '-'}). {msg2}"
         )
     return True, f"{p.name} installed from github.com/{slug}\n{msg}\n{msg2}"
 
@@ -1293,7 +1293,7 @@ def update_all_available(*, only_outdated: bool = True) -> tuple[bool, str]:
                     lines.append(f"· {p.id}: skip")
                 continue
         if slug in seen_slugs:
-            # monorepo already pulled — reinstall this unit if install.sh is shared
+            # monorepo already pulled - reinstall this unit if install.sh is shared
             dest = find_repo_dir(p) or (SRC_ROOT / slug.split("/")[-1])
             if dest.is_dir() and (dest / "install.sh").is_file():
                 ok, msg = run_install_script(dest)
@@ -1325,7 +1325,7 @@ def install_all_missing() -> tuple[bool, str]:
             lines.append(f"· {p.id}: skip (no github / local-only)")
             continue
         if slug in seen_slugs:
-            # same monorepo — re-run install only if still missing
+            # same monorepo - re-run install only if still missing
             if not p.on_disk():
                 dest = SRC_ROOT / slug.split("/")[-1]
                 if dest.is_dir():
@@ -1409,7 +1409,7 @@ def render_generated(state: dict[str, bool]) -> str:
     if not hm_wired:
         lines.extend(
             [
-                "# hyprmods manager (fallback — `hyprmods on hyprmods` to own these)",
+                "# hyprmods manager (fallback - `hyprmods on hyprmods` to own these)",
                 "bind = $mainMod, Y, exec, ~/.local/bin/hyprmods",
                 "bind = $mainMod SHIFT, Y, exec, ~/.local/bin/hyprmods menu",
                 "",
@@ -1439,7 +1439,7 @@ def ensure_hyprland_sources() -> tuple[bool, str]:
     text = HYPR_CONF.read_text(encoding="utf-8")
     original = text
 
-    # Patterns that used to live in the base conf — now owned by hyprmods.
+    # Patterns that used to live in the base conf - now owned by hyprmods.
     # Match full lines (optional whitespace).
     legacy = [
         r"^\s*exec-once\s*=\s*~/.local/bin/wallpaper-boot\b.*$",
@@ -1502,7 +1502,7 @@ def ensure_hyprland_sources() -> tuple[bool, str]:
             f"{SOURCE_LINE}\n"
         )
     elif SOURCE_LINE not in text:
-        # weird partial — force correct line at end
+        # weird partial - force correct line at end
         if not text.endswith("\n"):
             text += "\n"
         text += f"\n{SOURCE_LINE}\n"
@@ -1535,7 +1535,7 @@ def set_enabled(pid: str, want: bool, *, reload: bool = True) -> tuple[bool, str
         else:
             return False, (
                 f"{p.name}: not on disk and cannot auto-install "
-                f"(need: {', '.join(p.requires) or '—'})"
+                f"(need: {', '.join(p.requires) or '-'})"
             )
 
     state = load_enabled()
@@ -1561,7 +1561,7 @@ def set_enabled(pid: str, want: bool, *, reload: bool = True) -> tuple[bool, str
             except Exception as e:
                 return True, install_note + f"{p.name} enabled (activate warn: {e})"
         notify("hyprmods", f"{p.name} wired (enabled)")
-        return True, install_note + f"{p.name} enabled — binds/boot active"
+        return True, install_note + f"{p.name} enabled - binds/boot active"
     else:
         # teardown first while hooks still exist
         if p.on_disable:
@@ -1576,7 +1576,7 @@ def set_enabled(pid: str, want: bool, *, reload: bool = True) -> tuple[bool, str
         if reload:
             hypr_reload()
         notify("hyprmods", f"{p.name} uninstalled (disabled)")
-        return True, f"{p.name} disabled — hotkeys inert, boot removed"
+        return True, f"{p.name} disabled - hotkeys inert, boot removed"
 
 
 def toggle_enabled(pid: str) -> tuple[bool, str]:
@@ -1601,7 +1601,7 @@ def apply_all() -> tuple[bool, str]:
 def format_binds_block(p: Project, *, indent: str = "         ") -> list[str]:
     """Pretty multi-line bind list for terminal."""
     if not p.binds:
-        return [f"{indent}keys   (none — no keyboard binds)"]
+        return [f"{indent}keys   (none - no keyboard binds)"]
     lines: list[str] = []
     # column widths within this project
     w_when = max(len(b.when) for b in p.binds)
@@ -1784,15 +1784,6 @@ APP_CSS = """
 window { background-color: #0c0a12; }
 .header-bar { background-color: alpha(#120f1a, 0.94); }
 .title-main { font-size: 1.35em; font-weight: 750; letter-spacing: -0.02em; }
-.title-sub { opacity: 0.55; font-size: 0.88em; }
-.chip {
-  background-color: alpha(#b794f6, 0.16);
-  color: #d4b8ff;
-  border-radius: 999px;
-  padding: 3px 12px;
-  font-size: 0.78em;
-  font-weight: 600;
-}
 .section-label {
   font-size: 0.72em;
   font-weight: 700;
@@ -1933,7 +1924,7 @@ def run_ui() -> int:
             self.meta_lbl.set_size_request(0, -1)
             left.append(self.meta_lbl)
 
-            # keybind cheat-sheet — stack key + action so narrow windows work
+            # keybind cheat-sheet - stack key + action so narrow windows work
             self.bind_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
             self.bind_box.add_css_class("bind-block")
             self.bind_box.set_hexpand(True)
@@ -1943,7 +1934,7 @@ def run_ui() -> int:
             head.set_size_request(0, -1)
             self.bind_box.append(head)
             if not proj.binds:
-                none = Gtk.Label(label="none — no keyboard binds", xalign=0)
+                none = Gtk.Label(label="none - no keyboard binds", xalign=0)
                 none.add_css_class("bind-none")
                 none.set_ellipsize(Pango.EllipsizeMode.END)
                 none.set_size_request(0, -1)
@@ -2173,7 +2164,7 @@ def run_ui() -> int:
             self.rows: list[ProjectRow] = []
             self.set_default_size(520, 640)
             self.set_resizable(True)
-            # Explicit tiny min — Hyprland otherwise clamps to GTK's content min
+            # Explicit tiny min - Hyprland otherwise clamps to GTK's content min
             self.set_size_request(200, 120)
 
             provider = Gtk.CssProvider()
@@ -2219,22 +2210,7 @@ def run_ui() -> int:
             t.set_ellipsize(Pango.EllipsizeMode.END)
             t.set_wrap(False)
             title_row.append(t)
-            self.theme_chip = Gtk.Label(label=f"theme · {current_theme()}")
-            self.theme_chip.add_css_class("chip")
-            self.theme_chip.set_ellipsize(Pango.EllipsizeMode.END)
-            self.theme_chip.set_size_request(0, -1)
-            title_row.append(self.theme_chip)
-            refresh = Gtk.Button(label="↻")
-            refresh.set_tooltip_text("Refresh")
-            refresh.connect("clicked", lambda *_: self.refresh_all())
-            title_row.append(refresh)
             header.append(title_row)
-
-            sub = _soft_label(
-                "Toggle = wire into Hyprland · ↑ = newer version on GitHub · keys listed per card"
-            )
-            sub.add_css_class("title-sub")
-            header.append(sub)
             root.append(header)
 
             list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -2303,7 +2279,6 @@ def run_ui() -> int:
                 for row in self.rows:
                     if not row._busy:
                         row.refresh()
-                self.theme_chip.set_label(f"theme · {current_theme()}")
                 self._update_footer()
             return True
 
@@ -2329,7 +2304,6 @@ def run_ui() -> int:
         def refresh_all(self) -> None:
             for row in self.rows:
                 row.refresh()
-            self.theme_chip.set_label(f"theme · {current_theme()}")
             self._update_footer()
             self._check_updates_async(force=True)
 
