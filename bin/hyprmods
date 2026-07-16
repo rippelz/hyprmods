@@ -237,11 +237,21 @@ class Project:
     on_enable: Optional[Callable[[], None]] = None
     # live activity (informational only - mode currently running)
     activity: Optional[Callable[[], str]] = None
+    # non-empty = red error in UI/CLI (e.g. missing input group for zoomd)
+    health_error: Optional[Callable[[], str]] = None
 
     def on_disk(self) -> bool:
         if not self.requires:
             return True
         return all(which(r) is not None or plugin_path(r) is not None for r in self.requires)
+
+    def error_msg(self) -> str:
+        if not self.health_error:
+            return ""
+        try:
+            return (self.health_error() or "").strip()
+        except Exception:
+            return ""
 
     def repo_slug(self) -> str:
         g = (self.github or "").strip()
@@ -365,6 +375,62 @@ def _enable_infiniscroll() -> None:
 def _infini_activity() -> str:
     if (STATE_ROOT / "infiniscroll" / "on").exists():
         return "mode ON"
+    return ""
+
+
+def user_in_group(name: str) -> bool:
+    """True if current user is in group `name` (e.g. input for evdev)."""
+    code, out = run(["id", "-nG"], timeout=5)
+    if code == 0 and out:
+        return name in out.split()
+    try:
+        import grp
+
+        gid = grp.getgrnam(name).gr_gid
+        return gid in os.getgroups()
+    except (KeyError, OSError):
+        # no such group on this system → nothing to enforce
+        return True
+
+
+def _zoomd_alive() -> bool:
+    pidf = STATE_ROOT / "infiniscroll" / "zoomd.pid"
+    if pidf.is_file():
+        try:
+            pid = int(pidf.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+            return True
+        except (OSError, ValueError):
+            pass
+    return _pgrep_f(r"infiniscroll-zoomd|infiniscroll-rt\s+zoomd")
+
+
+def _infini_health_error() -> str:
+    """Red-banner conditions: input group / zoomd for Super+scroll."""
+    if not which("infiniscroll") and not which("infiniscroll-rt"):
+        return ""
+    if not user_in_group("input"):
+        return (
+            "ERROR: Super+scroll needs `input` group — "
+            "sudo usermod -aG input $USER  then re-login"
+        )
+    if not (STATE_ROOT / "infiniscroll" / "on").exists():
+        return ""
+    errf = STATE_ROOT / "infiniscroll" / "zoomd.err"
+    if errf.is_file():
+        try:
+            line = errf.read_text(encoding="utf-8").strip().splitlines()
+            detail = line[0].strip() if line else "zoomd failed"
+        except OSError:
+            detail = "zoomd failed"
+        if len(detail) > 90:
+            detail = detail[:87] + "..."
+        return f"ERROR: Super+scroll broken — {detail}"
+    if not _zoomd_alive():
+        return (
+            "ERROR: zoomd not running — Super+scroll dead "
+            "(toggle Super+I or check ~/.local/state/infiniscroll/zoomd.log)"
+        )
     return ""
 
 
@@ -652,6 +718,7 @@ def build_projects() -> list[Project]:
             on_disable=_disable_infiniscroll,
             on_enable=_enable_infiniscroll,
             activity=_infini_activity,
+            health_error=_infini_health_error,
         ),
         Project(
             id="theme",
@@ -1647,12 +1714,18 @@ def cmd_list(plain: bool = False, *, check_updates: bool = True) -> int:
     print(f"conf   {GENERATED}")
     print()
     n_upd = 0
+    n_err = 0
     for p in PROJECTS:
         upd = updates.get(p.id)
+        err = p.error_msg() if (p.on_disk() and state.get(p.id, True)) else ""
         if not p.on_disk():
             mark = "✗ miss"
             gh = p.repo_slug()
             tag = f"not on disk · install: github.com/{gh}" if gh else "not on disk (local-only)"
+        elif err:
+            n_err += 1
+            mark = "! ERR"
+            tag = err
         elif state.get(p.id, True):
             mark = "● ON "
             act = p.activity() if p.activity else ""
@@ -1660,12 +1733,12 @@ def cmd_list(plain: bool = False, *, check_updates: bool = True) -> int:
         else:
             mark = "○ off"
             tag = "unwired"
-        if upd and upd.available:
+        if not err and upd and upd.available:
             n_upd += 1
             mark = "↑ UPD"
             extra = upd.short_label()
             tag = f"{extra} · {tag}" if tag else extra
-        elif upd and upd.local_ver and p.on_disk():
+        elif not err and upd and upd.local_ver and p.on_disk():
             fv = _fmt_ver(upd.local_ver)
             # avoid "v0.1.1 · v0.1.1" when activity already shows the version
             if fv and fv not in (tag or ""):
@@ -1676,9 +1749,11 @@ def cmd_list(plain: bool = False, *, check_updates: bool = True) -> int:
             print(line)
         print()
     print("  toggle = wire/unwire Hyprland  ·  install = clone from GitHub if missing")
+    if n_err:
+        print(f"  {n_err} error(s) — fix then re-open hyprmods / toggle the project")
     if n_upd:
         print(f"  {n_upd} update(s) available · hyprmods update <id> · hyprmods update-all")
-    else:
+    elif not n_err:
         print("  hyprmods install winbar · hyprmods update-all · hyprmods")
     return 0
 
@@ -1706,8 +1781,11 @@ def cmd_menu() -> int:
     lines = []
     for p in PROJECTS:
         upd = updates.get(p.id)
+        err = p.error_msg() if (p.on_disk() and state.get(p.id, True)) else ""
         if not p.on_disk():
             tag = "[miss]"
+        elif err:
+            tag = "[ERR]"
         elif upd and upd.available:
             tag = "[UPD]"
         elif state.get(p.id, True):
@@ -1862,7 +1940,10 @@ window { background-color: #0c0a12; }
 .status-off { background-color: alpha(#fff, 0.06); color: alpha(#ebe6f4, 0.55); }
 .status-miss { background-color: alpha(#c4a1ff, 0.12); color: #c4a1ff; }
 .status-upd { background-color: alpha(#f0c674, 0.22); color: #f0c674; }
+.status-err { background-color: alpha(#f07178, 0.25); color: #f07178; }
 .mod-row.update { border-color: alpha(#f0c674, 0.5); }
+.mod-row.error { border-color: alpha(#f07178, 0.6); }
+.mod-meta.error { color: #f07178; opacity: 0.95; }
 .footer {
   background-color: alpha(#120f1a, 0.95);
   border-top: 1px solid alpha(#fff, 0.06);
@@ -2018,7 +2099,9 @@ def run_ui() -> int:
             self.remove_css_class("on")
             self.remove_css_class("missing")
             self.remove_css_class("update")
-            for c in ("status-on", "status-off", "status-miss", "status-upd"):
+            self.remove_css_class("error")
+            self.meta_lbl.remove_css_class("error")
+            for c in ("status-on", "status-off", "status-miss", "status-upd", "status-err"):
                 self.status.remove_css_class(c)
 
             upd = cached_update(self.proj)
@@ -2050,14 +2133,20 @@ def run_ui() -> int:
                 self.install_btn.set_visible(False)
             on = is_enabled(self.proj.id)
             has_upd = bool(upd and upd.available)
-            if has_upd:
+            err = self.proj.error_msg() if on else ""
+            if err:
+                self.add_css_class("error")
+                self.status.set_label("ERROR")
+                self.status.add_css_class("status-err")
+                self.meta_lbl.add_css_class("error")
+            elif has_upd:
                 self.add_css_class("update")
                 self.status.set_label("UPDATE")
                 self.status.add_css_class("status-upd")
             else:
                 self.status.set_label("WIRED" if on else "off")
                 self.status.add_css_class("status-on" if on else "status-off")
-            if on and not has_upd:
+            if on and not has_upd and not err:
                 self.add_css_class("on")
             act = self.proj.activity() if self.proj.activity else ""
             n_keys = len(self.proj.binds)
@@ -2065,15 +2154,21 @@ def run_ui() -> int:
             if n_keys == 0:
                 key_bit = "no keys"
             bits = [f"id · {self.proj.id}", key_bit]
-            if act:
+            if err:
+                bits.append(err)
+            elif act:
                 bits.append(act)
-            if upd and upd.available:
+            if not err and upd and upd.available:
                 bits.append(upd.short_label())
-            elif upd and upd.local_ver:
+            elif not err and upd and upd.local_ver:
                 bits.append(_fmt_ver(upd.local_ver))
             self.meta_lbl.set_label("  ·  ".join(bits))
+            if err:
+                self.meta_lbl.set_tooltip_text(err)
+            else:
+                self.meta_lbl.set_tooltip_text("")
             if self.update_btn:
-                self.update_btn.set_visible(has_upd)
+                self.update_btn.set_visible(has_upd and not err)
                 self.update_btn.set_sensitive(not self._busy and has_upd)
                 if not self._busy:
                     self.update_btn.set_label("Update")
@@ -2314,13 +2409,22 @@ def run_ui() -> int:
             n_upd = 0
             upd_names: list[str] = []
             seen_slugs: set[str] = set()
+            err_names: list[str] = []
             for p in PROJECTS:
+                if st.get(p.id, True) and p.on_disk() and p.error_msg():
+                    err_names.append(p.name)
                 info = cached_update(p)
                 if info and info.available and info.slug not in seen_slugs:
                     seen_slugs.add(info.slug)
                     n_upd += 1
                     upd_names.append(p.name)
             bits = []
+            if err_names:
+                bits.append(
+                    f"! {len(err_names)} error"
+                    + ("s" if len(err_names) != 1 else "")
+                    + f" · {', '.join(err_names)}"
+                )
             if n_upd:
                 bits.append(f"↑ {n_upd} update" + ("s" if n_upd != 1 else ""))
                 if len(upd_names) <= 4:
