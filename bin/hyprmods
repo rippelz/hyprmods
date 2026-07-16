@@ -658,8 +658,8 @@ def build_projects() -> list[Project]:
             name="Theme switcher",
             desc="theme + theme-ui gallery (applied look stays in theme.conf)",
             category="project",
-            source=str(HOME / ".config" / "themes"),
-            github="",  # personal theme store - not published
+            source=str(HOME / "code" / "themes"),
+            github="themes",
             requires=["theme-ui"],
             conf_lines=[
                 "# theme switcher",

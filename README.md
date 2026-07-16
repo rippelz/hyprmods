@@ -31,7 +31,7 @@ Needs `gh` auth for **private** repos (or SSH git remotes).
 | hypr-minimize | built with winbar |
 | autoclicker | [rippelz/autoclicker](https://github.com/rippelz/autoclicker) |
 | wallpaper-boot, opaque, app-recency, rgb, obs-replay | [rippelz/hypr-bits](https://github.com/rippelz/hypr-bits) |
-| theme | local only (`~/.config/themes`) |
+| theme | [rippelz/themes](https://github.com/rippelz/themes) |
 
 Clones land in `~/.local/src/hyprmods/<repo>/` when not already installed.
 
