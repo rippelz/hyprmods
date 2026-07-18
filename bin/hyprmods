@@ -1501,6 +1501,19 @@ def render_generated(state: dict[str, bool]) -> str:
             continue
         lines.extend(p.conf_lines)
         lines.append("")
+    # winmode-boot (winbar's exec-once) is what launches waybar at login.
+    # If winbar is missing/off, autostart a plain waybar so the desktop
+    # isn't bar-less after reboot.
+    wb = next((p for p in PROJECTS if p.id == "winbar"), None)
+    wb_wired = bool(wb and state.get("winbar", True) and wb.on_disk())
+    if not wb_wired:
+        lines.extend(
+            [
+                "# waybar (fallback - winbar off, `hyprmods on winbar` to hand back)",
+                "exec-once = waybar",
+                "",
+            ]
+        )
     # Super+Y lives on the hyprmods project. If that unit is missing/off,
     # still inject binds so the manager stays reachable.
     hm = next((p for p in PROJECTS if p.id == "hyprmods"), None)
